@@ -1,0 +1,346 @@
+using System;
+using System.Runtime.InteropServices;
+using Xunit;
+using Xunit.Sdk;
+
+namespace GrotheImages.Tests;
+
+public sealed class GpuIntegrationTests
+{
+    [Theory]
+    [InlineData(PixelFormat.Gray8, 1)]
+    [InlineData(PixelFormat.Bgra32, 4)]
+    [InlineData(PixelFormat.Rgba32, 4)]
+    [InlineData(PixelFormat.Bgr24, 3)]
+    [InlineData(PixelFormat.Rgb24, 3)]
+    [InlineData(PixelFormat.Yuv444, 3)]
+    public void TransferFormatsRoundTripThroughGpuUpdateAndLoad(PixelFormat format, int bytesPerPixel)
+    {
+        const int width = 2;
+        const int height = 2;
+        byte[] source = new byte[width * height * bytesPerPixel];
+        for (int i = 0; i < source.Length; i++) source[i] = (byte)(i * 19 + 7);
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            using var image = CreateGpuImage(format, width, height);
+            image.Update(0, sourcePtr, width, height, width * bytesPerPixel, format, TransformMatrix.Identity);
+            image.Load(0, outputPtr, width, height, width * bytesPerPixel, format, TransformMatrix.Identity);
+
+            byte[] result = new byte[source.Length];
+            Marshal.Copy(outputPtr, result, 0, result.Length);
+            for (int i = 0; i < source.Length; i++) Assert.InRange(result[i], (byte)Math.Max(0, source[i] - 2), (byte)Math.Min(255, source[i] + 2));
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void RgbaTileUpdateAndIdentityLoadRoundTrip()
+    {
+        const int width = 4;
+        const int height = 4;
+        byte[] source = new byte[width * height * 4];
+        for (int i = 0; i < source.Length; i++) source[i] = (byte)(i * 7);
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, width, height);
+            image.UpdateTile(0, 0, 0, sourcePtr, width, height, width * 4, PixelFormat.Rgba32);
+            image.Load(0, outputPtr, width, height, width * 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+
+            byte[] result = new byte[source.Length];
+            Marshal.Copy(outputPtr, result, 0, result.Length);
+            Assert.Equal(source, result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void TranslationLoadUsesInverseMatrixAndTileOwnership()
+    {
+        const int width = 4;
+        const int height = 1;
+        byte[] source = { 10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255 };
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, width, height);
+            image.UpdateTile(0, 0, 0, sourcePtr, width, height, width * 4, PixelFormat.Rgba32);
+            var load = new TransformMatrix(1, 0, -1, 0, 1, 0, 0, 0, 1);
+            image.Load(0, outputPtr, width, height, width * 4, PixelFormat.Rgba32, load);
+
+            byte[] result = new byte[source.Length];
+            Marshal.Copy(outputPtr, result, 0, result.Length);
+            Assert.Equal(20, result[0]);
+            Assert.Equal(30, result[4]);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void RgbaUpdateUsesGpuWarpPath()
+    {
+        const int width = 4;
+        const int height = 4;
+        byte[] source = new byte[width * height * 4];
+        for (int i = 0; i < source.Length; i++) source[i] = (byte)(255 - i);
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, width, height);
+            image.Update(0, sourcePtr, width, height, width * 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            image.Load(0, outputPtr, width, height, width * 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+
+            byte[] result = new byte[source.Length];
+            Marshal.Copy(outputPtr, result, 0, result.Length);
+            Assert.Equal(source, result);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void Yuv422UsesSeparatePlanesAndRgbTransfer()
+    {
+        const int width = 4;
+        const int height = 2;
+        byte[] source = new byte[width * height * 4];
+        for (int i = 0; i < source.Length; i += 4)
+        {
+            source[i] = 80;
+            source[i + 1] = 100;
+            source[i + 2] = 120;
+            source[i + 3] = 255;
+        }
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            using var image = CreateGpuImage(PixelFormat.Yuv422, width, height);
+            image.Update(0, sourcePtr, width, height, width * 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            image.Load(0, outputPtr, width, height, width * 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+
+            byte[] result = new byte[source.Length];
+            Marshal.Copy(outputPtr, result, 0, result.Length);
+            Assert.InRange(result[0], (byte)65, (byte)95);
+            Assert.InRange(result[1], (byte)85, (byte)115);
+            Assert.InRange(result[2], (byte)105, (byte)135);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void Yuv420UsesHalfResolutionUvPlane()
+    {
+        const int width = 4;
+        const int height = 2;
+        byte[] source = new byte[width * height * 4];
+        for (int i = 0; i < source.Length; i += 4)
+        {
+            source[i] = 90;
+            source[i + 1] = 110;
+            source[i + 2] = 130;
+            source[i + 3] = 255;
+        }
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            using var image = CreateGpuImage(PixelFormat.Yuv420, width, height);
+            image.Update(0, sourcePtr, width, height, width * 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            image.Load(0, outputPtr, width, height, width * 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+
+            byte[] result = new byte[source.Length];
+            Marshal.Copy(outputPtr, result, 0, result.Length);
+            Assert.InRange(result[0], (byte)75, (byte)105);
+            Assert.InRange(result[1], (byte)95, (byte)125);
+            Assert.InRange(result[2], (byte)115, (byte)145);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void UpdateTileCanWriteNativeYuv422Planes()
+    {
+        byte[] y = { 90, 90, 90, 90, 90, 90, 90, 90 };
+        byte[] uv = { 128, 128, 128, 128 };
+        byte[] output = new byte[8 * 4];
+        IntPtr yPtr = Marshal.AllocHGlobal(y.Length);
+        IntPtr uvPtr = Marshal.AllocHGlobal(uv.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
+        try
+        {
+            Marshal.Copy(y, 0, yPtr, y.Length);
+            Marshal.Copy(uv, 0, uvPtr, uv.Length);
+            using var image = CreateGpuImage(PixelFormat.Yuv422, 4, 2);
+            image.UpdateTile(0, 0, 0, yPtr, 4, uvPtr, 4, PixelFormat.Yuv422);
+            image.Load(0, outputPtr, 4, 2, 16, PixelFormat.Rgba32, TransformMatrix.Identity);
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+            Assert.InRange(output[0], (byte)80, (byte)105);
+            Assert.InRange(output[1], (byte)80, (byte)105);
+            Assert.InRange(output[2], (byte)80, (byte)105);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(yPtr);
+            Marshal.FreeHGlobal(uvPtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void OverlapSamplingUsesTheRightHalfBoundaryRule()
+    {
+        const int tileWidth = 100;
+        const int columns = 4;
+        const int imageWidth = 370;
+        byte[] output = new byte[imageWidth * 4];
+        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
+        try
+        {
+            using var image = new GrotheImage(GrotheImageInfo.FromTiles(tileWidth, 1, 1, columns, 10, 0), PixelFormat.Rgba32, "a");
+            for (int column = 0; column < columns; column++)
+            {
+                byte[] tile = new byte[tileWidth * 4];
+                for (int x = 0; x < tileWidth; x++)
+                {
+                    tile[x * 4] = (byte)(10 + column * 20);
+                    tile[x * 4 + 3] = 255;
+                }
+                IntPtr tilePtr = Marshal.AllocHGlobal(tile.Length);
+                try
+                {
+                    Marshal.Copy(tile, 0, tilePtr, tile.Length);
+                    image.UpdateTile(0, 0, column, tilePtr, tileWidth, 1, tileWidth * 4, PixelFormat.Rgba32);
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(tilePtr);
+                }
+            }
+
+            image.Load(0, outputPtr, imageWidth, 1, imageWidth * 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+            Assert.Equal(10, output[94 * 4]);
+            Assert.Equal(30, output[95 * 4]);
+            Assert.Equal(30, output[184 * 4]);
+            Assert.Equal(50, output[185 * 4]);
+            Assert.Equal(50, output[274 * 4]);
+            Assert.Equal(70, output[275 * 4]);
+            Assert.Equal(70, output[369 * 4]);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void ComposeLoadRunsMultipleLayerChannelsInOnePixelShader()
+    {
+        IntPtr outputPtr = Marshal.AllocHGlobal(4);
+        IntPtr aPtr = Marshal.AllocHGlobal(4);
+        IntPtr bPtr = Marshal.AllocHGlobal(4);
+        try
+        {
+            Marshal.Copy(new byte[] { 50, 0, 0, 255 }, 0, aPtr, 4);
+            Marshal.Copy(new byte[] { 0, 100, 150, 255 }, 0, bPtr, 4);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, 1, 1);
+            image.UpdateTile(0, 0, 0, aPtr, 1, 1, 4, PixelFormat.Rgba32);
+            using var twoLayer = new GrotheImage(new GrotheImageInfo(1, 1, 1, 1), PixelFormat.Rgba32, "a", "b");
+            twoLayer.UpdateTile(0, 0, 0, aPtr, 1, 1, 4, PixelFormat.Rgba32);
+            twoLayer.UpdateTile(1, 0, 0, bPtr, 1, 1, 4, PixelFormat.Rgba32);
+            var compose = twoLayer.CreateLayerCompose("a.r, b.gb * 0.5, 1");
+            twoLayer.Load(compose, outputPtr, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+
+            byte[] result = new byte[4];
+            Marshal.Copy(outputPtr, result, 0, 4);
+            Assert.InRange(result[0], (byte)48, (byte)52);
+            Assert.InRange(result[1], (byte)48, (byte)52);
+            Assert.InRange(result[2], (byte)73, (byte)77);
+            Assert.Equal(255, result[3]);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(outputPtr);
+            Marshal.FreeHGlobal(aPtr);
+            Marshal.FreeHGlobal(bPtr);
+        }
+    }
+
+    [Fact]
+    public void TextureArrayPagesAreSelectedByLoadShader()
+    {
+        const int columns = 2050;
+        byte[] first = { 77 };
+        byte[] last = { 99 };
+        byte[] output = new byte[columns];
+        IntPtr firstPtr = Marshal.AllocHGlobal(1);
+        IntPtr lastPtr = Marshal.AllocHGlobal(1);
+        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
+        try
+        {
+            Marshal.Copy(first, 0, firstPtr, 1);
+            Marshal.Copy(last, 0, lastPtr, 1);
+            using var image = new GrotheImage(GrotheImageInfo.FromTiles(1, 1, 1, columns), PixelFormat.Gray8, "a");
+            image.UpdateTile(0, 0, 0, firstPtr, 1, 1, 1, PixelFormat.Gray8);
+            image.UpdateTile(0, 0, columns - 1, lastPtr, 1, 1, 1, PixelFormat.Gray8);
+            image.Load(0, outputPtr, columns, 1, columns, PixelFormat.Gray8, TransformMatrix.Identity);
+
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+            Assert.Equal(77, output[0]);
+            Assert.Equal(99, output[columns - 1]);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(firstPtr);
+            Marshal.FreeHGlobal(lastPtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    private static GrotheImage CreateGpuImage(PixelFormat format, int width, int height)
+    {
+        try
+        {
+            return new GrotheImage(new GrotheImageInfo(width, height, width, height), format, "a");
+        }
+        catch (Exception ex) when (ex is GrotheImageException || ex is DllNotFoundException || ex is TypeInitializationException)
+        {
+            throw SkipException.ForSkip("D3D11 hardware is unavailable: " + ex.Message);
+        }
+    }
+}

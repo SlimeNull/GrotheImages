@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="GrotheImages.Tests/GrotheImages.Tests.csproj" />
+  <Project Path="GrotheImages/GrotheImages.csproj" />
+</Solution>
