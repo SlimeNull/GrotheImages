@@ -12,6 +12,7 @@ internal sealed class LayerStore : IDisposable
     private readonly GrotheImageInfo _info;
     private readonly PixelFormat _format;
     private readonly Dictionary<long, TileArrayPage> _pages = new Dictionary<long, TileArrayPage>();
+    private readonly HashSet<long> _writtenTiles = new HashSet<long>();
 
     public LayerStore(D3D11DeviceContext graphics, GrotheImageInfo info, PixelFormat format)
     {
@@ -22,6 +23,13 @@ internal sealed class LayerStore : IDisposable
     }
 
     public long PageCount { get; }
+
+    public IReadOnlyCollection<long> WrittenTiles => _writtenTiles;
+
+    public void MarkWritten(long row, long column)
+    {
+        _writtenTiles.Add(TileGrid.GetLinearIndex(_info, row, column));
+    }
 
     public TileArrayPage GetPageForTile(long row, long column, out int slice)
     {

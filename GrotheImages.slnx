@@ -1,4 +1,7 @@
 <Solution>
   <Project Path="GrotheImages.Tests/GrotheImages.Tests.csproj" />
-  <Project Path="GrotheImages/GrotheImages.csproj" />
+  <Project Path="GrotheImages/GrotheImages.csproj">
+    <Platform Project="x64" />
+  </Project>
+  <Project Path="GrotheImagesPlayground/GrotheImagesPlayground.csproj" />
 </Solution>

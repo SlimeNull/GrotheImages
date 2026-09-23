@@ -100,6 +100,7 @@ internal sealed class UpdateProgram : IDisposable
             else
                 _image.Graphics.Context.CSSetUnorderedAccessViews(0, new[] { page.Color.UnorderedAccessView });
             _image.Graphics.Context.Dispatch((_image.Info.TileWidth + 7) / 8, (_image.Info.TileHeight + 7) / 8, 1);
+            store.MarkWritten(row, column);
             _image.Graphics.Context.CSSetUnorderedAccessViews(0, new ID3D11UnorderedAccessView[] { null, null });
             _image.Graphics.Context.CSSetShaderResources(0, new ID3D11ShaderResourceView[] { null });
         }

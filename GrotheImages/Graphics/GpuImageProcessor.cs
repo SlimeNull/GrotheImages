@@ -35,7 +35,9 @@ internal static class GpuImageProcessor
         if (format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420)
         {
             UpdateResource(image.Graphics, page.Y.Texture, subresource, scan0, stride, image.Info.TileHeight);
-            UpdateResource(image.Graphics, page.Uv.Texture, subresource, secondScan0, secondStride, image.Info.TileHeight);
+            UpdateResource(image.Graphics, page.Uv.Texture, subresource, secondScan0, secondStride,
+                format == PixelFormat.Yuv420 ? image.Info.TileHeight / 2 : image.Info.TileHeight);
+            store.MarkWritten(tileRow, tileColumn);
             return;
         }
 
@@ -45,13 +47,16 @@ internal static class GpuImageProcessor
             case PixelFormat.Rgba32:
             case PixelFormat.Gray8:
                 UpdateResource(image.Graphics, page.Color.Texture, subresource, scan0, stride, height);
+                store.MarkWritten(tileRow, tileColumn);
                 return;
             case PixelFormat.Bgr24:
             case PixelFormat.Rgb24:
                 UpdatePacked24(image.Graphics, page.Color.Texture, subresource, scan0, width, height, stride, format);
+                store.MarkWritten(tileRow, tileColumn);
                 return;
             case PixelFormat.Yuv444:
                 UpdateYuv444(image.Graphics, page, subresource, scan0, width, height, stride);
+                store.MarkWritten(tileRow, tileColumn);
                 return;
             default:
                 throw new ArgumentOutOfRangeException(nameof(format));

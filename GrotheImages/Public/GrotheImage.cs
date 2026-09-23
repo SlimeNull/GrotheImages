@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.IO;
 using System.Linq;
 
 namespace GrotheImages;
@@ -32,6 +33,29 @@ public sealed class GrotheImage : IDisposable
     public GrotheImageInfo Info { get; }
     public PixelFormat Format { get; }
     public ReadOnlyCollection<string> LayerNames { get; }
+
+    public void Serialize(Stream stream)
+    {
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            GrotheImageSerializer.Write(this, stream);
+        }
+    }
+
+    public static GrotheImage Deserialize(Stream stream) => GrotheImageSerializer.Read(stream);
+
+    public void Save(string path)
+    {
+        if (path == null) throw new ArgumentNullException(nameof(path));
+        using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None)) Serialize(stream);
+    }
+
+    public static GrotheImage Open(string path)
+    {
+        if (path == null) throw new ArgumentNullException(nameof(path));
+        using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)) return Deserialize(stream);
+    }
 
     public void Update(int layerIndex, nint scan0, int width, int height, int stride, PixelFormat format, TransformMatrix transformMatrix)
     {
@@ -109,6 +133,8 @@ public sealed class GrotheImage : IDisposable
 
     internal D3D11DeviceContext Graphics => _graphics;
     internal LayerStore GetLayer(int index) => _layers[index];
+    internal bool HasTileStorage => _layers != null;
+    internal void EnsureGraphicsForSerialization() => EnsureGraphics();
 
     public void Dispose()
     {

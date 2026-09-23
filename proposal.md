@@ -544,3 +544,23 @@ GPU 集成测试覆盖：
 - `Load` 的输出 alpha 是否允许表达式指定，还是所有无 alpha 输出固定为 1。
 - 同一重叠区域被多次 `Update` 写入时是否采用最后提交者覆盖，或需要额外的 blend 策略。
 - 是否允许调用方指定后备文件路径并在多个 `GrotheImage` 之间复用持久化 tile 文件；默认临时文件后端不依赖这一扩展。
+
+## 13. 二进制序列化
+
+实现提供 `GrotheImage.Serialize(Stream)`、`GrotheImage.Deserialize(Stream)`、`Save(string)` 和 `Open(string)`。文件头依次包含 ASCII magic `GROTHEIM`、32 位 version code、六个 `GrotheImageInfo` 几何字段、`PixelFormat`、layer 名称列表和已写入 tile 数量。
+
+反序列化先读取 magic/version，再通过内部 `IGrotheImageLoader` 注册表选择加载器。目前注册 `GrotheImageLoaderV1`，未知版本直接抛出 `NotSupportedException`。每条 tile 记录保存 layer、row、column、plane 数量、plane 宽高、字节数和逐行原生纹理数据；Yuv444/Yuv422/Yuv420 保存独立 Y/UV plane。所有长度、坐标、格式、plane 数量和文件结束位置都校验，重复 tile 坐标和截断 payload 直接判定为损坏文件。
+
+序列化使用稀疏策略，只写入实际经过 `Update` 或 `UpdateTile` 的 tile；未写入 tile 由构造时的格式零值恢复。新增文件版本时只需实现新的 `IGrotheImageLoader` 并注册对应 version code，不修改已有加载器。
+
+## 14. GrotheImagesPlayground
+
+`GrotheImagesPlayground` 是 SDK 样式 WPF `net462` 应用，使用默认 WPF 控件样式。界面按 Tab 分为：
+
+- New：逻辑尺寸布局和 `FromTiles` 等尺寸、overlap、格式、layer 参数。
+- Update：图片文件、layer、源宽高、stride、传输格式和四点拖拽透视区域。
+- UpdateTile：tile 行列、尺寸、stride、普通文件或 Y/UV 原生 plane 文件。
+- Load / Export：layer 或 compose、输出尺寸、stride、格式、四点目标区域和导出文件。
+- Persistence：保存/打开 versioned GrotheImage 二进制文件。
+
+四点编辑器以 source rectangle 的四个角为输入，通过八元一次方程求解 3x3 透视矩阵；Update 的 source rectangle 是输入文件尺寸，Load 的 source rectangle 是 GrotheImage 逻辑尺寸，目标点坐标分别落在 GrotheImage 或导出图像坐标系中。
