@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 using Xunit;
 using Xunit.Sdk;
@@ -143,9 +144,10 @@ public sealed class GpuIntegrationTests
 
             byte[] result = new byte[source.Length];
             Marshal.Copy(outputPtr, result, 0, result.Length);
-            Assert.InRange(result[0], (byte)65, (byte)95);
-            Assert.InRange(result[1], (byte)85, (byte)115);
-            Assert.InRange(result[2], (byte)105, (byte)135);
+            // A flat colour round trips through the BT.709 limited range pair within a couple of levels.
+            Assert.InRange(result[0], (byte)77, (byte)83);
+            Assert.InRange(result[1], (byte)97, (byte)103);
+            Assert.InRange(result[2], (byte)118, (byte)124);
         }
         finally
         {
@@ -178,9 +180,9 @@ public sealed class GpuIntegrationTests
 
             byte[] result = new byte[source.Length];
             Marshal.Copy(outputPtr, result, 0, result.Length);
-            Assert.InRange(result[0], (byte)75, (byte)105);
-            Assert.InRange(result[1], (byte)95, (byte)125);
-            Assert.InRange(result[2], (byte)115, (byte)145);
+            Assert.InRange(result[0], (byte)87, (byte)93);
+            Assert.InRange(result[1], (byte)107, (byte)113);
+            Assert.InRange(result[2], (byte)127, (byte)133);
         }
         finally
         {
@@ -707,6 +709,439 @@ public sealed class GpuIntegrationTests
         byte[] before = LoadGray(image, (int)image.Info.Width, (int)image.Info.Height);
         image.BlendSeams();
         Assert.Equal(before, LoadGray(image, (int)image.Info.Width, (int)image.Info.Height));
+    }
+
+    [Fact]
+    public void UpdateMapsUserImageCoordinatesIntoTheGrotheImage()
+    {
+        // The matrix maps User Image coordinates to Grothe Image coordinates, so a 2x scale makes a 2x2 User
+        // Image cover the whole 4x4 Grothe Image. Reading the matrix in the other direction would instead
+        // magnify the Grothe Image into the User Image and leave almost every pixel untouched.
+        using var image = CreateGpuImage(PixelFormat.Rgba32, 4, 4);
+        byte[] source = new byte[2 * 2 * 4];
+        for (int i = 0; i < source.Length; i += 4) { source[i] = 200; source[i + 1] = 10; source[i + 2] = 30; source[i + 3] = 255; }
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(4 * 4 * 4);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            image.Update(0, sourcePtr, 2, 2, 8, PixelFormat.Rgba32, new TransformMatrix(2, 0, 0, 0, 2, 0, 0, 0, 1));
+            image.Load(0, outputPtr, 4, 4, 16, PixelFormat.Rgba32, TransformMatrix.Identity);
+
+            byte[] output = new byte[4 * 4 * 4];
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+            for (int i = 0; i < output.Length; i += 4)
+            {
+                Assert.Equal(200, output[i]);
+                Assert.Equal(10, output[i + 1]);
+                Assert.Equal(30, output[i + 2]);
+                Assert.Equal(255, output[i + 3]);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void UpdateClipsPixelsOutsideTheUserImage()
+    {
+        // A 0.5 scale puts the User Image over Grothe Image pixel (0, 0) only. Every other pixel is clipped,
+        // so it keeps the value an earlier write left there instead of being cleared.
+        using var image = CreateGpuImage(PixelFormat.Rgba32, 4, 4);
+        byte[] fill = new byte[4 * 4 * 4];
+        for (int i = 0; i < fill.Length; i += 4) { fill[i] = 100; fill[i + 3] = 255; }
+        byte[] source = new byte[2 * 2 * 4];
+        for (int i = 0; i < source.Length; i += 4) { source[i] = 7; source[i + 3] = 255; }
+        IntPtr fillPtr = Marshal.AllocHGlobal(fill.Length);
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(fill.Length);
+        try
+        {
+            Marshal.Copy(fill, 0, fillPtr, fill.Length);
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            image.UpdateTile(0, 0, 0, fillPtr, 4, 4, 16, PixelFormat.Rgba32);
+            image.Update(0, sourcePtr, 2, 2, 8, PixelFormat.Rgba32, new TransformMatrix(0.5, 0, 0, 0, 0.5, 0, 0, 0, 1));
+            image.Load(0, outputPtr, 4, 4, 16, PixelFormat.Rgba32, TransformMatrix.Identity);
+
+            byte[] output = new byte[fill.Length];
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+            // The covered pixel holds the User Image value, every clipped pixel still holds the fill.
+            Assert.Equal(7, output[0]);
+            Assert.Equal(100, output[4]);
+            Assert.Equal(100, output[4 * 4]);
+            Assert.Equal(100, output[(15 * 4) + 0]);
+            Assert.Equal(255, output[(15 * 4) + 3]);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(fillPtr);
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void ComposeBindsOnlyTheLayersTheExpressionNames()
+    {
+        // Only the layers the expression reads are bound, renumbered from zero in image order. A wrong
+        // binding would return another layer's red channel instead.
+        IntPtr aPtr = Marshal.AllocHGlobal(4);
+        IntPtr bPtr = Marshal.AllocHGlobal(4);
+        IntPtr cPtr = Marshal.AllocHGlobal(4);
+        IntPtr outputPtr = Marshal.AllocHGlobal(4);
+        try
+        {
+            Marshal.Copy(new byte[] { 11, 0, 0, 255 }, 0, aPtr, 4);
+            Marshal.Copy(new byte[] { 222, 0, 0, 255 }, 0, bPtr, 4);
+            Marshal.Copy(new byte[] { 33, 0, 0, 255 }, 0, cPtr, 4);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, 1, 1, "a", "b", "c");
+            image.UpdateTile(0, 0, 0, aPtr, 1, 1, 4, PixelFormat.Rgba32);
+            image.UpdateTile(1, 0, 0, bPtr, 1, 1, 4, PixelFormat.Rgba32);
+            image.UpdateTile(2, 0, 0, cPtr, 1, 1, 4, PixelFormat.Rgba32);
+
+            AssertComposition(image, "b.r, b.r, b.r, 1", new[] { 1 }, 222, outputPtr);
+            AssertComposition(image, "c.r, c.r, c.r, 1", new[] { 2 }, 33, outputPtr);
+            // Reading two of the three layers binds them in image order, not in expression order.
+            AssertComposition(image, "c.r, a.r, c.r, 1", new[] { 0, 2 }, 33, outputPtr);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(aPtr);
+            Marshal.FreeHGlobal(bPtr);
+            Marshal.FreeHGlobal(cPtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    private static void AssertComposition(GrotheImage image, string expression, int[] boundLayers, byte expectedRed, IntPtr outputPtr)
+    {
+        using var compose = image.CreateLayerCompose(expression);
+        Assert.Equal(boundLayers, compose.BoundLayerIndices);
+        image.Load(compose, outputPtr, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+        byte[] result = new byte[4];
+        Marshal.Copy(outputPtr, result, 0, 4);
+        Assert.Equal(expectedRed, result[0]);
+        Assert.Equal(255, result[3]);
+    }
+
+    [Fact]
+    public void EveryImageSharesOneDirect3DDevice()
+    {
+        using var first = CreateGpuImage(PixelFormat.Gray8, 4, 4);
+        using var second = CreateGpuImage(PixelFormat.Gray8, 4, 4);
+        UpdateGrayTile(first, 0, 0, 4, 4, 42);
+        UpdateGrayTile(second, 0, 0, 4, 4, 7);
+
+        Assert.Same(first.Graphics.Device, second.Graphics.Device);
+        Assert.Same(first.Graphics.Context, second.Graphics.Context);
+        Assert.True(first.Graphics.FeatureLevel >= Vortice.Direct3D.FeatureLevel.Level_11_0);
+    }
+
+    [Fact]
+    public void YuvRoundTripKeepsDarkAndBrightGrays()
+    {
+        // Limited range storage compresses luma to 16..235; encoding luma without that compression (while
+        // still decoding it as limited range) crushes dark values and clips bright ones.
+        using var image = CreateGpuImage(PixelFormat.Yuv420, 4, 2);
+        IntPtr sourcePtr = Marshal.AllocHGlobal(4 * 2 * 4);
+        IntPtr outputPtr = Marshal.AllocHGlobal(4 * 2 * 4);
+        try
+        {
+            foreach (byte value in new byte[] { 8, 32, 64, 96, 128, 192, 250 })
+            {
+                byte[] source = new byte[4 * 2 * 4];
+                for (int i = 0; i < source.Length; i += 4) { source[i] = value; source[i + 1] = value; source[i + 2] = value; source[i + 3] = 255; }
+                Marshal.Copy(source, 0, sourcePtr, source.Length);
+                image.Update(0, sourcePtr, 4, 2, 16, PixelFormat.Rgba32, TransformMatrix.Identity);
+                image.Load(0, outputPtr, 4, 2, 16, PixelFormat.Rgba32, TransformMatrix.Identity);
+
+                byte[] output = new byte[source.Length];
+                Marshal.Copy(outputPtr, output, 0, output.Length);
+                // A neutral gray has neutral chroma, so all three channels come back equal.
+                Assert.InRange(output[0], (byte)(value - 2), (byte)(value + 2));
+                Assert.InRange(output[1], (byte)(value - 2), (byte)(value + 2));
+                Assert.InRange(output[2], (byte)(value - 2), (byte)(value + 2));
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void UpdateDoesNotMarkTilesTheUserImageNeverReaches()
+    {
+        // Two 16 pixel tiles whose storage rectangles step 8 pixels apart, so they overlap. A User Image that
+        // only covers x in [0, 4) reaches tile 0 alone: tile 1 has to stay unwritten, which shows both in the
+        // serialized record count and in tile 1 still reading back as the empty value.
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(16, 4, 1, 2, 8, 0), PixelFormat.Gray8);
+        UpdateGrayTile(image, 0, 0, 16, 4, 200);
+
+        byte[] source = new byte[4 * 4];
+        for (int i = 0; i < source.Length; i++) source[i] = 7;
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            image.Update(0, sourcePtr, 4, 4, 4, PixelFormat.Gray8, TransformMatrix.Identity);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+        }
+
+        // 0..3 are the update, 4..11 are the clipped part of tile 0, 12..23 are owned by the unwritten tile 1.
+        byte[] row = LoadGrayRow(image, (int)image.Info.Width, 4, 0);
+        Assert.Equal(7, row[0]);
+        Assert.Equal(200, row[4]);
+        Assert.Equal(200, row[11]);
+        Assert.Equal(0, row[12]);
+
+        using var stream = new MemoryStream();
+        image.Serialize(stream);
+        byte[] bytes = stream.ToArray();
+        // Header: magic(8) version(4) tileWidth(4) tileHeight(4) rows(8) columns(8) overlapX(4) overlapY(4)
+        // format(4) layerCount(4) = 52 bytes, then the single layer name "a" as a length byte plus one byte,
+        // then the 64 bit record count.
+        const int recordCountOffset = 54;
+        Assert.Equal(1L, BitConverter.ToInt64(bytes, recordCountOffset));
+    }
+
+    [Fact]
+    public void UnwrittenTilesLoadAsTheZeroValueOfTheirFormat()
+    {
+        // Only tile (0, 0) is written; the rest of the image keeps the value the page was initialised with
+        // instead of uninitialised memory.
+        using (var image = CreateGpuImage(GrotheImageInfo.FromTiles(4, 2, 1, 2), PixelFormat.Rgba32))
+        {
+            byte[] source = new byte[4 * 2 * 4];
+            for (int i = 0; i < source.Length; i += 4) { source[i] = 9; source[i + 3] = 255; }
+            IntPtr pointer = Marshal.AllocHGlobal(source.Length);
+            try
+            {
+                Marshal.Copy(source, 0, pointer, source.Length);
+                image.UpdateTile(0, 0, 0, pointer, 4, 2, 16, PixelFormat.Rgba32);
+            }
+            finally { Marshal.FreeHGlobal(pointer); }
+
+            byte[] pixels = LoadRgba(image, 8, 2, 32);
+            for (int y = 0; y < 2; y++)
+            for (int x = 4; x < 8; x++)
+            {
+                int pixel = y * 8 + x;
+                Assert.Equal(0, pixels[pixel * 4 + 0]);
+                Assert.Equal(0, pixels[pixel * 4 + 1]);
+                Assert.Equal(0, pixels[pixel * 4 + 2]);
+                Assert.Equal(0, pixels[pixel * 4 + 3]);
+            }
+            // The written tile keeps its own value on both rows.
+            Assert.Equal(9, pixels[0]);
+            Assert.Equal(9, pixels[(8 + 3) * 4]);
+        }
+
+        // A YUV tile starts at luma zero and neutral chroma, which decodes to opaque black.
+        using (var image = CreateGpuImage(GrotheImageInfo.FromTiles(4, 2, 1, 2), PixelFormat.Yuv420))
+        {
+            byte[] pixels = LoadRgba(image, 8, 2, 32);
+            for (int pixel = 0; pixel < 16; pixel++)
+            {
+                Assert.InRange(pixels[pixel * 4 + 0], (byte)0, (byte)2);
+                Assert.InRange(pixels[pixel * 4 + 1], (byte)0, (byte)2);
+                Assert.InRange(pixels[pixel * 4 + 2], (byte)0, (byte)2);
+                Assert.Equal(255, pixels[pixel * 4 + 3]);
+            }
+        }
+    }
+
+    [Fact]
+    public void OverlapWiderThanTwiceTheStepStillSamplesEveryTile()
+    {
+        // tileWidth 10 with overlap 8 leaves a step of 2, so a tile owns a 2 pixel wide band while storing
+        // 10 pixels. The sampling ownership rule still has to select each tile across the whole image.
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(10, 4, 1, 4, 8, 0), PixelFormat.Gray8);
+        Assert.Equal(2, image.Info.StepX);
+        for (int column = 0; column < 4; column++) UpdateGrayTile(image, 0, column, 10, 4, (byte)(column * 60));
+
+        // Ownership: floor((x + 0.5 - overlap / 2) / step), so the bands are 0..5, 6..7, 8..9 and 10..15.
+        byte[] pixels = LoadGray(image, (int)image.Info.Width, 4);
+        Assert.Equal(0, pixels[0]);
+        Assert.Equal(0, pixels[5]);
+        Assert.Equal(60, pixels[6]);
+        Assert.Equal(60, pixels[7]);
+        Assert.Equal(120, pixels[8]);
+        Assert.Equal(120, pixels[9]);
+        Assert.Equal(180, pixels[10]);
+        Assert.Equal(180, pixels[15]);
+    }
+
+    [Fact]
+    public void SamplingBindsThePageOfTheTileTheOwnershipRuleSelects()
+    {
+        // 2049 tiles of 10 x 4 pixels with a step of 2: tile 2047 is the last slice of page 0 and tile 2048 is
+        // the only slice of page 1. A load that maps onto the low end of that boundary has to bind page 0,
+        // which a range computed from the storage rectangle instead of the ownership band would miss.
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(10, 4, 1, 2049, 8, 0), PixelFormat.Gray8);
+        long lastOfFirstPage = LayerStore.MaxArraySlices - 1;
+        UpdateGrayTile(image, 0, lastOfFirstPage, 10, 4, 111);
+        UpdateGrayTile(image, 0, lastOfFirstPage + 1, 10, 4, 222);
+
+        // Grothe Image x = 4098 + u lands on User Image x = u for u in [0, 2). Both output pixels are owned by
+        // tile 2047, the last slice of page 0, even though their storage rectangle reaches into page 1.
+        var matrix = new TransformMatrix(1, 0, -4098, 0, 1, 0, 0, 0, 1);
+        IntPtr output = Marshal.AllocHGlobal(2 * 4);
+        try
+        {
+            image.Load(0, output, 2, 4, 2, PixelFormat.Gray8, matrix);
+            byte[] pixels = new byte[2 * 4];
+            Marshal.Copy(output, pixels, 0, pixels.Length);
+            Assert.Equal(111, pixels[0]);
+            Assert.Equal(111, pixels[1]);
+        }
+        finally { Marshal.FreeHGlobal(output); }
+    }
+
+    [Fact]
+    public void ATranslationCanTargetASingleTile()
+    {
+        // Two tiles of 4 x 2: the User Image maps to Grothe Image x in [4, 8), which is tile 1 alone. Tile 0 is
+        // never dispatched, so it stays at the empty value and only one tile record is serialized.
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(4, 2, 1, 2), PixelFormat.Gray8);
+        byte[] source = new byte[4 * 2];
+        for (int i = 0; i < source.Length; i++) source[i] = 77;
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            image.Update(0, sourcePtr, 4, 2, 4, PixelFormat.Gray8, new TransformMatrix(1, 0, 4, 0, 1, 0, 0, 0, 1));
+        }
+        finally { Marshal.FreeHGlobal(sourcePtr); }
+
+        byte[] pixels = LoadGray(image, 8, 2);
+        Assert.Equal(0, pixels[0]);
+        Assert.Equal(0, pixels[3]);
+        Assert.Equal(77, pixels[4]);
+        Assert.Equal(77, pixels[7]);
+        Assert.Equal(77, pixels[8 + 4]);
+
+        using var stream = new MemoryStream();
+        image.Serialize(stream);
+        byte[] bytes = stream.ToArray();
+        Assert.Equal(1L, BitConverter.ToInt64(bytes, 54));
+    }
+
+    [Fact]
+    public void RowPaddingIsRespectedOnEveryPath()
+    {
+        // A User Image row may be padded, so the source stride is wider than the row itself.
+        using (var image = CreateGpuImage(GrotheImageInfo.FromTiles(4, 2, 1, 1), PixelFormat.Gray8))
+        {
+            const int stride = 7;
+            byte[] source = new byte[stride * 2];
+            for (int y = 0; y < 2; y++)
+            for (int x = 0; x < 4; x++) source[y * stride + x] = (byte)(10 + y * 10 + x);
+            for (int y = 0; y < 2; y++)
+            for (int x = 4; x < stride; x++) source[y * stride + x] = 200;   // padding must be ignored
+
+            IntPtr pointer = Marshal.AllocHGlobal(source.Length);
+            try
+            {
+                Marshal.Copy(source, 0, pointer, source.Length);
+                image.UpdateTile(0, 0, 0, pointer, 4, 2, stride, PixelFormat.Gray8);
+            }
+            finally { Marshal.FreeHGlobal(pointer); }
+
+            byte[] pixels = LoadGray(image, 4, 2);
+            Assert.Equal(10, pixels[0]);
+            Assert.Equal(13, pixels[3]);
+            Assert.Equal(20, pixels[4]);
+            Assert.Equal(23, pixels[7]);
+        }
+
+        // The warp path uploads the padded rows too, then samples in User Image coordinates.
+        using (var image = CreateGpuImage(PixelFormat.Bgra32, 4, 2))
+        {
+            const int stride = 20;
+            byte[] source = new byte[stride * 2];
+            for (int y = 0; y < 2; y++)
+            for (int x = 0; x < 4; x++)
+            {
+                int index = y * stride + x * 4;
+                source[index] = (byte)(40 + y);
+                source[index + 3] = 255;
+            }
+            for (int y = 0; y < 2; y++)
+            for (int x = 16; x < stride; x++) source[y * stride + x] = 200;
+
+            IntPtr pointer = Marshal.AllocHGlobal(source.Length);
+            try
+            {
+                Marshal.Copy(source, 0, pointer, source.Length);
+                image.Update(0, pointer, 4, 2, stride, PixelFormat.Bgra32, TransformMatrix.Identity);
+            }
+            finally { Marshal.FreeHGlobal(pointer); }
+
+            byte[] pixels = TestImages.Load(image, 0, 4, 2, PixelFormat.Bgra32);
+            // Row 0 was written with 40 and row 1 with 41; the padded bytes never became pixels.
+            Assert.Equal(40, pixels[0]);
+            Assert.Equal(40, pixels[3 * 4]);
+            Assert.Equal(255, pixels[3 * 4 + 3]);
+            Assert.Equal(41, pixels[4 * 4]);
+            Assert.Equal(41, pixels[(4 + 3) * 4]);
+        }
+    }
+
+    [Fact]
+    public void LoadWritesRowsAtTheCallersStride()
+    {
+        using var image = CreateGpuImage(PixelFormat.Rgba32, 2, 2);
+        byte[] source = new byte[2 * 2 * 4];
+        for (int i = 0; i < source.Length; i += 4) { source[i] = 60; source[i + 3] = 255; }
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        int stride = 2 * 4 + 8;
+        IntPtr outputPtr = Marshal.AllocHGlobal(stride * 2);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            image.UpdateTile(0, 0, 0, sourcePtr, 2, 2, 8, PixelFormat.Rgba32);
+
+            // The gap between the rows must stay untouched, whatever the caller put there.
+            byte[] output = new byte[stride * 2];
+            for (int i = 0; i < output.Length; i++) output[i] = 0xAB;
+            Marshal.Copy(output, 0, outputPtr, output.Length);
+            image.Load(0, outputPtr, 2, 2, stride, PixelFormat.Rgba32, TransformMatrix.Identity);
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+
+            Assert.Equal(60, output[0]);
+            Assert.Equal(60, output[4]);
+            Assert.Equal(0xAB, output[8]);
+            Assert.Equal(0xAB, output[15]);
+            Assert.Equal(60, output[stride + 0]);
+            Assert.Equal(60, output[stride + 4]);
+            Assert.Equal(0xAB, output[stride + 8]);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    private static byte[] LoadRgba(GrotheImage image, int width, int height, int stride)
+    {
+        IntPtr output = Marshal.AllocHGlobal(stride * height);
+        try
+        {
+            image.Load(0, output, width, height, stride, PixelFormat.Rgba32, TransformMatrix.Identity);
+            byte[] result = new byte[stride * height];
+            Marshal.Copy(output, result, 0, result.Length);
+            return result;
+        }
+        finally { Marshal.FreeHGlobal(output); }
     }
 
     private static void UpdateGrayTile(GrotheImage image, long row, long column, int width, int height, byte value)

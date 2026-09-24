@@ -38,7 +38,7 @@
                 <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="8">
                     <TextBlock Text="Input file"/><DockPanel><TextBox x:Name="UpdateFile"/><Button Content="Browse" DockPanel.Dock="Right" Width="90" Click="BrowseUpdateClick"/></DockPanel>
                     <WrapPanel Margin="0,6"><TextBlock Text="Layer" VerticalAlignment="Center"/><TextBox x:Name="UpdateLayer" Width="55" Text="0" Margin="5,0,15,0"/><TextBlock Text="Detected" VerticalAlignment="Center"/><TextBlock x:Name="UpdateFileInfo" Text="Choose an image file." Margin="5,0,0,0" VerticalAlignment="Center"/></WrapPanel>
-                    <TextBlock Text="Drag the four red points to define the destination quadrilateral. Coordinates are in the target image." Margin="0,8,0,4"/>
+                    <TextBlock Text="Drag the four red points to place the User Image quadrilateral inside the Grothe Image. Coordinates are in the Grothe Image; Update maps User Image pixels to Grothe Image pixels." Margin="0,8,0,4" TextWrapping="Wrap"/>
                     <local:PerspectiveEditor x:Name="UpdatePerspective" HorizontalAlignment="Left"/>
                     <Button Content="Update" Width="120" HorizontalAlignment="Left" Margin="0,8" Click="UpdateClick"/>
                 </StackPanel></ScrollViewer>
@@ -61,7 +61,7 @@
                     <WrapPanel><TextBlock Text="Mode" VerticalAlignment="Center"/><ComboBox x:Name="LoadMode" Width="150" Margin="5,0,15,0"><ComboBoxItem Content="Layer" IsSelected="True"/><ComboBoxItem Content="Compose"/></ComboBox><TextBlock Text="Layer" VerticalAlignment="Center"/><TextBox x:Name="LoadLayer" Width="55" Text="0" Margin="5,0,15,0"/><TextBlock Text="Format" VerticalAlignment="Center"/><ComboBox x:Name="LoadFormat" Width="120"/></WrapPanel>
                     <TextBlock Text="Compose expression (for Compose mode)" Margin="0,8,0,2"/><TextBox x:Name="ComposeExpression" Text="a.r, a.g, a.b, 1"/>
                     <WrapPanel Margin="0,8"><TextBlock Text="Output width"/><TextBox x:Name="LoadWidth" Width="70" Text="1024" Margin="5,0,15,0"/><TextBlock Text="Height"/><TextBox x:Name="LoadHeight" Width="70" Text="768" Margin="5,0,15,0"/><TextBlock Text="Stride"/><TextBox x:Name="LoadStride" Width="90" Text="0"/></WrapPanel>
-                    <TextBlock Text="The current GrotheImage is shown below. Drag the four points to select a source quadrilateral." Margin="0,8,0,4" TextWrapping="Wrap"/>
+                    <TextBlock Text="The current GrotheImage is shown below. Drag the four points to select the Grothe Image quadrilateral that is rendered into the User Image; Load maps Grothe Image pixels to User Image pixels." Margin="0,8,0,4" TextWrapping="Wrap"/>
                     <local:PerspectiveEditor x:Name="LoadPerspective" HorizontalAlignment="Left"/>
                     <TextBlock Text="Export file (.png or .jpg)" Margin="0,8,0,2"/><DockPanel><TextBox x:Name="ExportFile"/><Button Content="Browse" DockPanel.Dock="Right" Width="90" Click="BrowseExportClick"/></DockPanel>
                     <Button Content="Load and export" Width="140" HorizontalAlignment="Left" Margin="0,8" Click="LoadExportClick"/>

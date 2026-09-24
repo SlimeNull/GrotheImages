@@ -15,6 +15,25 @@ GrotheImages 是一个面向 .NET Framework 4.6.2 的 C# 图像处理库。它�
 
 第一版不承诺跨设备共享纹理、远程 GPU 和任意格式的色彩管理。逻辑尺寸不受 D3D11 单纹理上限限制，但实际可存储像素数受后备存储容量限制；GPU 显存只作为 tile cache，不作为整幅图像的容量上限。
 
+## 1.1 术语：User Image 和 Grothe Image
+
+整个库只有两个图像空间。所有 API 文档、参数说明、注释和测试命名都必须使用这两个术语，不再使用"输入图像/输出图像/source/target/逻辑图像"这类混称。
+
+- **User Image（用户图像）**：调用方内存里的一块像素矩形，由 `scan0`、`width`、`height`、`stride` 和 `PixelFormat` 描述。它可以是解码器输出、WPF 位图缓冲、导出文件缓冲或任意一块非托管内存。它的分配、格式和行距由调用方负责；库只在方法调用期间读写它，方法返回后不再持有它的引用。
+- **Grothe Image（Grothe 图像）**：`GrotheImage` 实例内部的分块逻辑图像，由 `GrotheImageInfo` 描述几何（tile 尺寸、行列数、overlap、逻辑宽高），由 `GrotheImage.Format` 描述存储格式，由 layer 名称索引一个或多个图层。它的像素存放在 GPU 的 tile 纹理中，逻辑尺寸可以远大于单张纹理上限。
+
+两个图像空间之间的数据方向与方法的语义一致，矩阵方向也随方法名走：
+
+| 方法 | 数据方向 | 矩阵方向 |
+| --- | --- | --- |
+| `Update(layerIndex, scan0, …)` | User Image → Grothe Image | **User Image 坐标 → Grothe Image 坐标** |
+| `Load(layerIndex, scan0, …)` | Grothe Image → User Image | **Grothe Image 坐标 → User Image 坐标** |
+| `Load(layerCompose, scan0, …)` | Grothe Image（多 layer 组合）→ User Image | **Grothe Image 坐标 → User Image 坐标** |
+| `UpdateTile(layerIndex, row, column, …)` | User Image（一个 tile 大小）→ Grothe Image | 没有矩阵：调用方直接给出 tile 行列 |
+| `BlendSeams()` | 只在 Grothe Image 内部原地修改 | 没有矩阵 |
+
+实现约定：`Update` 的矩阵是 User Image → Grothe Image，shader 逐 Grothe Image 像素反查 User Image 像素，所以 GPU 侧使用它的**逆矩阵**；`Load` 的矩阵是 Grothe Image → User Image，shader 逐 User Image 像素反查 Grothe Image 像素，GPU 侧同样使用**逆矩阵**。两条管线互为镜像，任何一侧改动都必须同步另一侧。
+
 ## 2. 项目创建与依赖
 
 项目使用 SDK 样式 csproj，创建命令为：
@@ -31,7 +50,7 @@ dotnet new classlib --name GrotheImages --framework net462
     <TargetFramework>net462</TargetFramework>
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Nullable>enable</Nullable>
+    <Nullable>disable</Nullable>
     <Platforms>x64</Platforms>
   </PropertyGroup>
 
@@ -39,7 +58,6 @@ dotnet new classlib --name GrotheImages --framework net462
     <PackageReference Include="Vortice.Direct3D11" Version="2.3.0" />
     <PackageReference Include="Vortice.DXGI" Version="2.3.0" />
     <PackageReference Include="Vortice.D3DCompiler" Version="2.3.0" />
-    <PackageReference Include="System.Collections.Immutable" Version="*" />
   </ItemGroup>
 </Project>
 ```
@@ -116,7 +134,7 @@ public readonly record struct TransformMatrix(
 [ w' ]   [ M20 M21 M22 ] [ 1 ]
 ```
 
-最终坐标为 `(x'/w', y'/w')`，因此偏移位于第三列 `M02/M12`。`Update` 把输入图像坐标映射到 GrotheImage 的逻辑坐标；`Load` 把 GrotheImage 坐标映射到输出图像坐标。GPU kernel 在每个输出像素上使用矩阵逆变换寻找源坐标，这与 OpenCV `warpPerspective` 的采样语义一致。例：从 `(100,100)` 开始读取时，`Load` 传入平移 `(-100,-100)`。
+最终坐标为 `(x'/w', y'/w')`，因此偏移位于第三列 `M02/M12`。`Update` 把 User Image 坐标映射到 Grothe Image 坐标；`Load` 把 Grothe Image 坐标映射到 User Image 坐标。GPU kernel 在每个目标像素上使用矩阵逆变换寻找源坐标，这与 OpenCV `warpPerspective` 的采样语义一致。例：从 `(100,100)` 开始读取时，`Load` 传入平移 `(-100,-100)`。
 
 矩阵求逆在 CPU 上预计算并传给 shader；奇异矩阵直接抛出 `ArgumentException`。矩阵元素先以 double 接收，提交到 GPU 前转换为 float，并检查转换后的有限值。
 
@@ -155,7 +173,7 @@ public enum PixelFormat
 
 外部传输格式的内存布局只对允许的 `Update`/`Load` 格式定义：`Bgra32` 为 B,G,R,A，`Rgba32` 为 R,G,B,A，`Gray8` 为单通道。BGR/RGB 24 位和所有 YUV 格式不存在外部 `scan0` 传输布局。指针、stride、整数溢出和最小缓冲区大小都在提交 GPU 前检查。
 
-内部通道使用归一化 float 语义，v1 不隐式执行 sRGB/gamma 转换。YUV 的 BT.709 limited 转换只发生在需要 RGB 输出或 RGB 输入写入 YUV layer 的 shader 中；表达式直接访问 YUV layer 时，`.r/.g/.b` 分别表示 Y/U/V，`.a` 为 1。
+内部通道使用归一化 float 语义，v1 不隐式执行 sRGB/gamma 转换。YUV 的 BT.709 limited 转换只发生在需要 RGB 输出或 RGB 输入写入 YUV layer 的 shader 中；表达式直接访问 YUV layer 时，`.r/.g/.b` 分别表示 Y/U/V，`.a` 为 1。编码和解码必须是同一套 limited range 公式：`Y'` 存 `16/255 + (219/255) * Y'`，`Cb`/`Cr` 存 `128/255 + (224/255) * (B'-Y')/1.8556` 和 `128/255 + (224/255) * (R'-Y')/1.5748`，解码逐项取逆。只压缩色度而把 full range 的 luma 直接写进 Y 平面会让往返出现约 10% 的亮度偏差（暗部压死、亮部削顶），因此两端的公式必须一起改。
 
 ### 4.3 图像信息和 tile 网格
 
@@ -252,7 +270,13 @@ last tile:   [TileOriginX + HalfOverlapX, ImageWidth)
 
 如果 overlap 为奇数，分界点可以是半像素；实现统一使用连续坐标比较，像素中心落在哪个半开区间就选择哪个 tile。为了让 YUV 子采样对齐，Yuv422/Yuv420 的 overlap 已经被要求为偶数，因此不会出现 UV 半像素归属边界。
 
-YUV 格式还必须满足采样子采样的对齐约束。`Yuv422` 要求逻辑 `Width`、`TileWidth` 和 `TileOverlapX` 都为偶数；`Yuv420` 要求逻辑 `Width/Height`、`TileWidth/TileHeight` 以及两个 overlap 都为偶数。这样 tile 原点、步长和 UV 平面尺寸始终按 2 对齐：Yuv422 的 UV tile 为 `(TileWidth/2) x TileHeight`，Yuv420 的 UV tile 为 `(TileWidth/2) x (TileHeight/2)`。不满足这些条件时，`GrotheImage` 构造函数直接抛出 `ArgumentException`。自动计算 tile 的构造函数必须在候选尺寸中选择满足这些约束的偶数 tile；无法同时满足请求逻辑尺寸、最大 tile 尺寸和对齐条件时直接失败。
+YUV 格式还必须满足采样子采样的对齐约束。`Yuv422` 要求逻辑 `Width`、`TileWidth` 和 `TileOverlapX` 都为偶数；`Yuv420` 要求逻辑 `Width/Height`、`TileWidth/TileHeight` 以及两个 overlap 都为偶数。这样 tile 原点、步长和 UV 平面尺寸始终按 2 对齐：Yuv422 的 UV tile 为 `(TileWidth/2) x TileHeight`，Yuv420 的 UV tile 为 `(TileWidth/2) x (TileHeight/2)`。不满足这些条件时，`GrotheImage` 构造函数直接抛出 `ArgumentException`。
+
+自动计算 tile 的构造函数（`new GrotheImageInfo(width, height, maxTileWidth, maxTileHeight, …)`）只处理几何，不接收 `PixelFormat`，因此对齐约束由 `GrotheImage` 构造函数在格式确定后校验，两者不能在一次调用里协同求解。几何求解的规则是：
+
+1. tile 必须等尺寸：tile 步长 `TileWidth - TileOverlapX` 必须整除 `width - TileOverlapX`，因此列数必须是该跨度的约数；行同理。
+2. 在所有满足条件的列数中取最小者，也就是**不超过 `maxTileWidth` 的最大 tile**。搜索用试除法枚举约数（`O(√span)`），不逐个递增试探。
+3. 等尺寸约束可能迫使 tile 远小于请求的最大值。**如果最佳等分方案的 tile 小于请求最大 tile 的一半，构造函数直接失败**并给出可用的 tile 尺寸建议：否则像质数尺寸（例如 `4093` 配 `maxTile 2048`）会静默退化成 4093×4093 个 1 像素 tile。需要这种尺寸的调用方改用 `FromTiles` 直接给出网格。
 
 完整坐标示意图见 [coordinate_system_with_tiles.png](coordinate_system_with_tiles.png)：
 
@@ -348,7 +372,7 @@ public sealed class GrotheImage : IDisposable
 
 ### 5.1.2 Texture2DArray 分页
 
-`Load`/compose 的渲染 pass 不对每个 tile 单独 dispatch。调度器先根据输出矩形和逆变换计算可能被访问的 tile 集合，把这个集合的所有 tile 资源装入 `Texture2DArray`，并把 array、tile 原点、步长、列数和图像边界作为 shader 参数一次绑定。像素着色器对每个输出像素自行完成 tile 选择和局部坐标计算。
+`Load`/compose 的渲染 pass 不对每个 tile 单独 dispatch。调度器先根据 User Image 矩形和矩阵的逆变换计算可能被访问的 Grothe Image tile 集合，把这个集合的所有 tile 资源装入 `Texture2DArray`，并把 array、tile 原点、步长、列数和图像边界作为 shader 参数一次绑定。像素着色器对每个 User Image 像素自行完成 tile 选择和局部坐标计算。
 
 D3D11 对单个 `Texture2DArray` 的 slice 数量和单次绑定的 SRV 数量都有设备上限，因此 `TileArrayBinding` 支持 page：每个 page 包含连续的 tile slice，并记录全局 tile index 到 `(page, slice)` 的映射。一次 Load 优先绑定覆盖输出区域的所有 page；如果 page 数超过 SRV 上限，才按 page 集合分成多个 render pass，每个 pass 仍由像素着色器按坐标采样，不回退到 CPU 逐像素处理。超出 GPU 工作集的 tile 在 pass 前从后备存储上传，pass 后按 cache 策略回收。
 
@@ -362,15 +386,19 @@ D3D11 对单个 `Texture2DArray` 的 slice 数量和单次绑定的 SRV 数量�
 
 ### 6.1 Update
 
-`Update` 的矩阵把输入图像坐标映射到 GrotheImage 逻辑坐标。实现步骤：
+`Update` 把 User Image 搬进 Grothe Image，矩阵把 **User Image 坐标映射到 Grothe Image 坐标**。实现步骤：
 
-1. 校验参数、源缓冲区大小、格式、矩阵和目标 layer。若 `format` 是 `Yuv422` 或 `Yuv420`，立即抛出异常；这两个值只表示 GrotheImage 的内部存储格式。
-2. 根据矩阵变换输入矩形的四个角，得到可能覆盖的逻辑包围盒，并与图像边界相交。
-3. 把允许的源格式上传到 upload texture；必要时在 GPU 中转换为图像格式的逻辑通道。若目标 layer 是 Yuv422/Yuv420，使用 YUV encode pass 分别写 Y 和 UV UAV；UV 写入按照目标格式的半分辨率坐标进行滤波。
-4. 对每个相交 tile dispatch `UpdateWarpCS`。shader 以 tile 输出像素为坐标，使用逆矩阵取得输入坐标，进行双线性采样，并写入该 tile 的单纹理或多平面 UAV。
+1. 校验参数、User Image 的 `scan0/width/height/stride`、格式、矩阵和目标 layer。若 `format` 是 `Yuv422` 或 `Yuv420`，立即抛出异常；这两个值只表示 Grothe Image 的内部存储格式。
+2. 根据矩阵变换 User Image 矩形的四个角，得到可能覆盖的 Grothe Image 包围盒，并与图像边界相交，得到本次要写入的 tile 范围。
+3. 把允许的源格式上传到 upload texture；必要时在 GPU 中转换为图像格式的逻辑通道。若目标 layer 是 Yuv422/Yuv420，YUV encode 分别写 Y 和 UV UAV；UV 写入按照目标格式的半分辨率坐标进行。
+4. 对每个相交 tile dispatch `UpdateWarpCS`。shader 以 Grothe Image 像素中心为坐标，使用矩阵的**逆矩阵**取得 User Image 坐标，进行双线性采样，并写入该 tile 的单纹理或多平面 UAV。
 5. 插入 UAV barrier/资源状态转换，更新 tile generation，释放临时资源。
 
-源图像之外的采样值为透明。对于透视变换，齐次坐标 `w` 接近 0 或无效时跳过写入。输入矩阵使用像素中心约定：像素中心为 `(x + 0.5, y + 0.5)`，避免旋转和缩放时产生半像素偏移。
+User Image 之外的采样被 **clip**：shader 放弃该像素、不写 UAV，tile 中该位置保留原有值（tile 的初始零值，或更早一次写入的结果）。`Update` 因此只覆盖 User Image 实际落到的区域，绝不清除任何像素；只有被真正写到的 tile 才计入“已写入”。对于透视变换，齐次除数 `|w|` 接近 0 或无效时同样 clip。输入矩阵使用像素中心约定：像素中心为 `(x + 0.5, y + 0.5)`，避免旋转和缩放时产生半像素偏移。
+
+tile 级别的选择必须和这条规则一致：只有存储矩形与变换后的 User Image 四边形真正相交的 tile 才 dispatch，否则一次只覆盖局部区域的 `Update` 会把包围盒边缘那些一个像素都没写到的 tile 标记成“已写入”，`BlendSeams` 随后就会把它们未初始化的内容混进邻居。落在四边形内部但采样越界的像素仍然由 shader 逐个 clip。
+
+矩阵方向由 API 契约固定：`Update` 收 User Image → Grothe Image，`Load` 收 Grothe Image → User Image（见 1.1）。两条管线都在 GPU 侧使用各自矩阵的逆，任何一侧改动必须同步另一侧。
 
 ### 6.2 UpdateTile
 
@@ -382,11 +410,11 @@ D3D11 对单个 `Texture2DArray` 的 slice 数量和单次绑定的 SRV 数量�
 
 ### 6.3 Load
 
-`Load(layerIndex, ...)` 的矩阵把 GrotheImage 逻辑坐标映射到输出坐标。实现步骤：
+`Load(layerIndex, ...)` 把 Grothe Image 渲染进 User Image，矩阵把 **Grothe Image 坐标映射到 User Image 坐标**。实现步骤：
 
 1. 校验输出 `format`。若为 `Yuv422` 或 `Yuv420`，立即抛出异常；它们不能作为外部 packed 输出。
-2. 创建匹配输出尺寸和输出格式的 GPU render target；`scan0` 只作为最后的 readback 目标，不直接作为像素着色器 render target。
-3. 按输出矩形和逆矩阵计算可能被访问的源逻辑区域，加载该区域需要的全部 tile，建立 `TileArrayBinding`，并把所有参与本次 pass 的 tile array/page、tile 网格参数和矩阵常量绑定到像素着色器。
+2. 创建匹配 User Image 尺寸和输出格式的 GPU render target；`scan0` 只作为最后的 readback 目标，不直接作为像素着色器 render target。
+3. 按 User Image 矩形和矩阵的**逆矩阵**计算可能被访问的 Grothe Image 区域，加载该区域需要的全部 tile，建立 `TileArrayBinding`，并把所有参与本次 pass 的 tile array/page、tile 网格参数和矩阵常量绑定到像素着色器。
 4. 对输出的每个像素执行 `LoadTilePS`。像素着色器先用逆矩阵把输出像素中心反算到源坐标，再按采样归属中线计算 tile 行列、array page/slice 和 tile 局部坐标，最后调用线性 sampler 从对应 `Texture2DArray` slice 采样。它不按 tile 分别 dispatch。
 5. 对 Yuv422/Yuv420 源 tile，像素着色器同时从 Y array 和 UV array 采样，然后按请求的 BGRA、RGBA 或 Gray 输出格式编码。`LayerCompose` 版本在同一个像素着色器中对采样出的逻辑通道执行编译后的 AST。
 6. GPU 完成 render target 和格式转换后复制到 staging texture，再把 staging 数据复制到调用方的 `scan0`。API 默认同步返回，内部可预留 command fence 以便以后增加异步版本。
@@ -565,7 +593,7 @@ AST 经类型检查后生成的是 `COMPOSE_PIXEL` 宏的值：每个 layer 引�
 
 生产模式下优先使用离线 shader 编译产物，开发模式允许调用 `D3DCompile` 并记录源码。编译错误转换为 `GrotheImageException`，其中包含 shader 文件名、编译器给出的行列号和这次注入的宏内容（含表达式），方便定位。
 
-当一次 compose 读取多个 tile 时，各 layer 必须使用同一逻辑坐标和同一边界透明规则。调度器按 tile 组合规划 dispatch，不能让不同 layer 采用不同的 tile 原点，否则表达式中的通道会错位。
+当一次 compose 读取多个 tile 时，各 layer 必须使用同一 Grothe Image 坐标和同一边界透明规则。调度器按 tile 组合规划 dispatch，不能让不同 layer 采用不同的 tile 原点，否则表达式中的通道会错位。表达式只读取它引用到的 layer：`LayerCompose` 记录这些 layer 的索引，`Load` 只把它们绑定到 shader 并把表达式里的引用重编号为 `layers[0]` 起，未引用的 layer 既不绑定也不分配 page。
 
 ## 8. Direct3D 设备和线程模型
 
@@ -576,7 +604,7 @@ AST 经类型检查后生成的是 `COMPOSE_PIXEL` 宏的值：每个 layer 引�
 - shader、sampler、buffer 和临时纹理池的生命周期。
 - `ID3D11DeviceContext` 的串行提交。
 
-`GrotheImage` 的公开方法默认线程安全：多个线程可以调用，但命令会在设备提交锁中串行化；同一个 image 的写读顺序以方法返回顺序为准。不同 `GrotheImage` 可以共享进程级 device，但 tile 元数据和生命周期独立。`Dispose` 后所有 API 抛出 `ObjectDisposedException`，并等待已提交 GPU 工作完成后释放资源。
+`GrotheImage` 的公开方法默认线程安全：多个线程可以调用，但命令会在设备提交锁中串行化；同一个 image 的写读顺序以方法返回顺序为准。整个进程共享一个 D3D11 device 和它的 immediate context（同一个 device 只有一个 immediate context，且不是线程安全的，所以提交锁是全局的），`D3D11DeviceContext` 按引用计数持有它，最后一个 `GrotheImage` 释放时才真正释放 device；tile 元数据和生命周期仍然按 image 独立。`Dispose` 后所有 API 抛出 `ObjectDisposedException`，并等待已提交 GPU 工作完成后释放资源。
 
 第一版采用同步 API，以保证调用方在返回时可以安全复用输入/输出内存。后续可以增加 `UpdateAsync`/`LoadAsync` 和显式 fence，但不能让当前同步方法隐式返回尚未完成的 DMA。
 
@@ -655,4 +683,4 @@ GPU 集成测试覆盖：
 - Load / Export：layer 或 compose、输出尺寸、stride、格式、四点目标区域和导出文件。
 - Persistence：保存/打开 versioned GrotheImage 二进制文件。
 
-四点编辑器以 source rectangle 的四个角为输入，通过八元一次方程求解 3x3 透视矩阵；Update 的 source rectangle 是输入文件尺寸，Load 的 source rectangle 是 GrotheImage 逻辑尺寸，目标点坐标分别落在 GrotheImage 或导出图像坐标系中。
+四点编辑器以矩形四个角为输入，通过八元一次方程求解 3x3 透视矩阵：Update 编辑器的矩形是 User Image（输入文件尺寸），拖拽目标是它落在 Grothe Image 里的四边形，因此该矩阵是 User Image → Grothe Image；Load 编辑器的矩形是 Grothe Image（逻辑尺寸），拖拽目标是它在 User Image 中占用的四边形，因此该矩阵是 Grothe Image → User Image。

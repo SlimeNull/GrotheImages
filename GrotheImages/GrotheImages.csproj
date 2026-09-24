@@ -19,7 +19,6 @@
     <PackageReference Include="Vortice.Direct3D11" Version="2.3.0" />
     <PackageReference Include="Vortice.DXGI" Version="2.3.0" />
     <PackageReference Include="Vortice.D3DCompiler" Version="2.3.0" />
-    <PackageReference Include="System.Collections.Immutable" Version="9.0.0" />
   </ItemGroup>
 
 </Project>

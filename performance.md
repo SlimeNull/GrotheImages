@@ -1,6 +1,6 @@
 # DirectX 操作与性能路径
 
-本文记录当前实现中 `Update`、`UpdateTile` 和 `Load` 的 Direct3D 11 操作、临时资源和数据方向。tile 纹理、shader、sampler 和 constant buffer 随所属 `GrotheImage` 或 `LayerCompose` 存活；调用过程创建的 source、render target 和 staging texture 在调用结束时释放。
+本文记录当前实现中 `Update`、`UpdateTile` 和 `Load` 的 Direct3D 11 操作、临时资源和数据方向。术语沿用设计规范 1.1 节：**User Image** 是调用方内存里的像素矩形（`scan0`/`width`/`height`/`stride`），**Grothe Image** 是 `GrotheImage` 内部的分块逻辑图像。`Update` 的方向是 User Image → Grothe Image，`Load` 的方向是 Grothe Image → User Image，两条管线在 GPU 侧都使用传入矩阵的逆。tile 纹理、shader、sampler 和 constant buffer 随所属 `GrotheImage` 或 `LayerCompose` 存活；调用过程创建的 source、render target 和 staging texture 在调用结束时释放。
 
 ## 设备和长期资源
 
@@ -15,12 +15,12 @@
 
 ## Update
 
-`Update` 的输入是用户内存中的一张图和 source-to-image 的透视矩阵：
+`Update` 把 User Image（用户内存中的一张图）搬进 Grothe Image，矩阵把 User Image 坐标映射到 Grothe Image 坐标：
 
-1. 根据本次 source `PixelFormat` 创建 GPU source texture：`Gray8` 使用 `R8_UNorm`，`Bgra32` 使用 `B8G8R8A8_UNorm`，`Rgba32` 使用 `R8G8B8A8_UNorm`。其他格式作为输入会被拒绝。
-2. 将输入内存通过 `UpdateSubresource` 上传到 source texture。这个上传只发生一次，之后的格式转换、透视采样和写入全部由 compute shader 完成。
-3. 根据透视矩阵包围盒，只遍历可能被源图覆盖的 tile。
-4. 一个图像级 `UpdateProgram` 缓存 compute shader、sampler 和 constant buffer，不按输入格式重新编译。shader 直接读取采样值；`Gray8` 采样结果的 G/B 为 0，不扩展为灰色 RGB。shader 根据 tile 原点反算 source 坐标，按目标存储格式写入 tile UAV。YUV 目标同时写 Y 和 UV 两个 UAV；YUV420/422 只在对应的偶数像素写 UV。
+1. 根据本次 User Image 的 `PixelFormat` 创建 GPU source texture：`Gray8` 使用 `R8_UNorm`，`Bgra32` 使用 `B8G8R8A8_UNorm`，`Rgba32` 使用 `R8G8B8A8_UNorm`。其他格式作为输入会被拒绝。
+2. 将 User Image 内存通过 `UpdateSubresource` 上传到 source texture。这个上传只发生一次，之后的格式转换、透视采样和写入全部由 compute shader 完成。
+3. 用矩阵变换 User Image 矩形四角，只遍历可能被 User Image 覆盖的 tile。
+4. 一个图像级 `UpdateProgram` 缓存 compute shader、sampler 和 constant buffer，不按输入格式重新编译。shader 以 Grothe Image 像素中心为坐标，用矩阵的**逆矩阵**反算 User Image 坐标，按目标存储格式写入 tile UAV。YUV 目标同时写 Y 和 UV 两个 UAV；YUV420/422 只在对应的偶数像素写 UV。采样落在 User Image 之外的像素被 clip（不写 UAV，保留 tile 原有值），只有存储矩形与变换后四边形相交的 tile 才 dispatch，因此 `Update` 从不清除像素，也不会把没写到的 tile 标记成已写入。
 5. `Flush` 后释放本次 source texture/view；program 随图像释放。
 
 没有 CPU readback，也不会为每个 tile 建立 render target。目标 tile 直接作为 UAV 写入，避免了 render-target 到 texture 的额外 `CopyResource`。
@@ -51,7 +51,7 @@
 
 ## Load
 
-`Load` 的矩阵表示 source image 到 output image 的变换。实现内部先求逆矩阵，pixel shader 根据当前输出像素反算 GrotheImage 坐标，再选择 page、array slice 和 tile-local 坐标。
+`Load` 把 Grothe Image 渲染进 User Image，矩阵表示 Grothe Image 到 User Image 的变换。实现内部先求逆矩阵，pixel shader 根据当前 User Image 像素反算 Grothe Image 坐标，再选择 page、array slice 和 tile-local 坐标。
 
 1. 创建 output render target texture，格式由输出 `PixelFormat` 决定。
 2. 创建同格式 staging texture。普通 Load 使用图像级缓存的 vertex/pixel shader、sampler 和 constant buffer；Compose Load 使用对应 `LayerCompose` 缓存的 program。
@@ -79,5 +79,8 @@ Load 必须把 GPU 结果交给用户内存，所以 staging map 和 CPU 行复�
 - `UpdateTile` 的转换中间资源只包含一个 tile，避免为整幅超大图像分配转换缓冲。
 - 直接格式匹配时跳过 shader 和中间资源。
 - 24 位和 YUV 传输格式会在参数校验时拒绝；Playground 使用 WPF 解码器将这类输入图像转换为 BGRA32。
-- 每个 `GrotheImage` 最多创建一个普通 Load program、一个 Update program 和一个 Blend program；每个被实际加载的 `LayerCompose` 最多创建一个自己的 Load program，重复调用时只创建单次传输纹理。
-- `Shaders/` 下的 HLSL 以 embedded resource 形式随程序集发布，进程内只读取和解析一次（成员重载表）；`CreateLayerCompose` 只做签名匹配，`Load` 不重复解析。C# 侧不拼接 shader 源码，只生成一个 `macros` include：`LAYER_COUNT`、`STORAGE_*`、`MEMBER_LIBRARY` 和 `COMPOSE_PIXEL` 都在其中，shader 用 `#if` 选择分支。只有表达式真的用到成员时 `MEMBER_LIBRARY` 才会被定义，`Common.hlsl` 也才会被 include 进这次编译。
+- 每个 `GrotheImage` 最多创建一个普通 Load program、一个 Update program 和一个 Blend program；每个被实际加载的 `LayerCompose` 最多创建一个自己的 Load program，重复调用时只创建单次传输纹理；compose 只为表达式真正引用的 layer 绑定 SRV 并分配 page。
+- 序列化按平面形状复用 staging texture（每种格式/尺寸一个），不为每个 tile 新建一张。
+- `Shaders/` 下的 HLSL 以 embedded resource 形式随程序集发布；`Common.hlsl` 在进程内只读取和解析一次（成员重载表）。`Load.hlsl`、`Update.hlsl` 和 `Blend.hlsl` 会在创建对应 program 时重新读取并编译，program 按 image 或 compose 缓存：同一个表达式被编译成多个 compose 时会有多次编译。C# 侧不拼接 shader 源码，只生成一个 `macros` include：`LAYER_COUNT`、`STORAGE_*`、`MEMBER_LIBRARY` 和 `COMPOSE_PIXEL` 都在其中，shader 用 `#if` 选择分支。只有表达式真的用到成员时 `MEMBER_LIBRARY` 才会被定义，`Common.hlsl` 也才会被 include 进这次编译。
+- 整个进程共享一个 D3D11 device 和 immediate context，所有命令提交在全局锁上串行化。
+- YUV 存储使用 BT.709 limited range：`Update.hlsl` 的 luma 和色度都按 `16..235`/`16..240` 压缩，`Load.hlsl` 逐项取逆，两端公式必须成对修改。

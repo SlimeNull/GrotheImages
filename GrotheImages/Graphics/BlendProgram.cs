@@ -168,9 +168,11 @@ internal sealed class BlendProgram : IDisposable
             var context = image.Graphics.Context;
             context.CSSetShader(GetShader(plane.Chroma, crossArray));
             context.CSSetConstantBuffers(0, new[] { _constants });
+            // Both slots are always written, so the shader variant that reads only u0 can never inherit the
+            // second view of a previous seam.
             context.CSSetUnorderedAccessViews(0, crossArray
                 ? new[] { resourceA.UnorderedAccessView, resourceB.UnorderedAccessView }
-                : new[] { resourceA.UnorderedAccessView });
+                : new[] { resourceA.UnorderedAccessView, null });
             context.UpdateSubresource(values, _constants, 0, 0, 0, null);
             context.Dispatch((seam.Width + 7) / 8, (seam.Height + 7) / 8, 1);
         }

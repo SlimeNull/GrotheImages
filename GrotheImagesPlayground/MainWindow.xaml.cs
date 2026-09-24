@@ -4,6 +4,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using WpfPixelFormats = System.Windows.Media.PixelFormats;
 using GrotheImages;
 using Microsoft.Win32;
@@ -16,6 +17,11 @@ public partial class MainWindow : Window
     private LayerCompose _compose;
     private string _composeExpression;
 
+    // Typing in a text box must not run a full GPU load per keystroke, so refreshes are coalesced into one
+    // pass after the user stops typing.
+    private readonly DispatcherTimer _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+    private Action _pendingRefresh;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -24,12 +30,36 @@ public partial class MainWindow : Window
         LoadFormat.ItemsSource = formats.Where(IsTransferFormat).ToArray();
         NewFormat.SelectedItem = PixelFormat.Rgba32;
         LoadFormat.SelectedItem = PixelFormat.Bgra32;
-        LoadLayer.TextChanged += (_, __) => TryRefresh(RefreshLoadSelector);
-        LoadMode.SelectionChanged += (_, __) => TryRefresh(RefreshLoadSelector);
-        ComposeExpression.TextChanged += (_, __) => { ResetCompose(); TryRefresh(RefreshLoadSelector); };
-        UpdateFile.TextChanged += (_, __) => TryRefresh(RefreshUpdateFileInfo);
-        TileFile.TextChanged += (_, __) => TryRefresh(RefreshTileFileInfo);
+        _refreshTimer.Tick += (_, __) =>
+        {
+            _refreshTimer.Stop();
+            Action refresh = _pendingRefresh;
+            _pendingRefresh = null;
+            if (refresh != null) TryRefresh(refresh);
+        };
+        LoadLayer.TextChanged += (_, __) => RequestRefresh(RefreshLoadSelector);
+        LoadMode.SelectionChanged += (_, __) => RequestRefresh(RefreshLoadSelector);
+        LoadFormat.SelectionChanged += (_, __) => RequestRefresh(RefreshLoadSelector);
+        LoadWidth.TextChanged += (_, __) => RequestRefresh(RefreshLoadSelector);
+        LoadHeight.TextChanged += (_, __) => RequestRefresh(RefreshLoadSelector);
+        ComposeExpression.TextChanged += (_, __) => RequestRefresh(ResetComposeAndRefresh);
+        UpdateFile.TextChanged += (_, __) => RequestRefresh(RefreshUpdateFileInfo);
+        TileFile.TextChanged += (_, __) => RequestRefresh(RefreshTileFileInfo);
         RefreshImageUi();
+    }
+
+    /// <summary>Queues one refresh; a burst of text changes produces a single preview update.</summary>
+    private void RequestRefresh(Action refresh)
+    {
+        _pendingRefresh = refresh;
+        _refreshTimer.Stop();
+        _refreshTimer.Start();
+    }
+
+    private void ResetComposeAndRefresh()
+    {
+        ResetCompose();
+        RefreshLoadSelector();
     }
 
     private void CreateLogicalClick(object sender, RoutedEventArgs e)
@@ -217,6 +247,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _refreshTimer.Stop();
         ResetCompose();
         _image?.Dispose();
         base.OnClosed(e);
@@ -401,7 +432,17 @@ public partial class MainWindow : Window
     }
 
     private void RequireImage() { if (_image == null) throw new InvalidOperationException("Create or open a GrotheImage first."); }
-    private static void TryRefresh(Action action) { try { action(); } catch { } }
+
+    /// <summary>
+    /// Refreshes a preview without interrupting typing. Failures are reported in the status bar instead of
+    /// being swallowed, because a preview that silently stops updating is worse than a visible error.
+    /// </summary>
+    private void TryRefresh(Action action)
+    {
+        try { action(); }
+        catch (Exception ex) { StatusText.Text = ex.GetType().Name + ": " + ex.Message; }
+    }
+
     private static bool IsSubsampled(PixelFormat format) => format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420;
     private static bool IsYuv(PixelFormat format) => format == PixelFormat.Yuv444 || IsSubsampled(format);
 
@@ -413,7 +454,18 @@ public partial class MainWindow : Window
         return alongX + alongY;
     }
     private static bool IsTransferFormat(PixelFormat format) => format == PixelFormat.Bgra32 || format == PixelFormat.Rgba32 || format == PixelFormat.Gray8;
-    private static int BytesPerPixel(PixelFormat format) => format == PixelFormat.Gray8 ? 1 : 4;
+
+    /// <summary>Bytes per pixel of a transfer format; anything else is a programming error, not a size of 4.</summary>
+    private static int BytesPerPixel(PixelFormat format)
+    {
+        switch (format)
+        {
+            case PixelFormat.Gray8: return 1;
+            case PixelFormat.Bgra32:
+            case PixelFormat.Rgba32: return 4;
+            default: throw new ArgumentOutOfRangeException(nameof(format), format + " is not a transfer format.");
+        }
+    }
     private static int Int(System.Windows.Controls.TextBox box) => int.Parse(box.Text);
     private static long Long(System.Windows.Controls.TextBox box) => long.Parse(box.Text);
     private static int IntOr(System.Windows.Controls.TextBox box, int fallback) => string.IsNullOrWhiteSpace(box.Text) || box.Text == "0" ? fallback : int.Parse(box.Text);

@@ -41,7 +41,7 @@ internal sealed class LoadProgram : IDisposable
             0,
             float.MaxValue));
         _constants = image.Graphics.Device.CreateBuffer(
-            new float[28],
+            new float[ShaderParameters.FloatCount],
             BindFlags.ConstantBuffer,
             ResourceUsage.Default,
             CpuAccessFlags.None,
@@ -50,75 +50,89 @@ internal sealed class LoadProgram : IDisposable
             0);
     }
 
-    public void Execute(int layerIndex, nint output, int width, int height, int stride, PixelFormat format, TransformMatrix inverse)
+    /// <summary>
+    /// Reads a rectangle of the Grothe Image into a User Image. <paramref name="userToGrothe"/> is the
+    /// inverse of the matrix the public API takes: the pixel shader turns a User Image pixel into a Grothe
+    /// Image coordinate with it, and the page selection turns the User Image rectangle back into tiles.
+    /// </summary>
+    public void Execute(int layerIndex, nint output, int width, int height, int stride, PixelFormat format, TransformMatrix userToGrothe)
     {
         GrotheImage image = _image;
         DxgiFormat renderFormat = GetRenderFormat(format);
-            ID3D11Texture2D render = image.Graphics.Device.CreateTexture2D(
-                renderFormat, width, height, 1, 1, null,
-                BindFlags.RenderTarget,
-                ResourceOptionFlags.None,
-                ResourceUsage.Default,
-                CpuAccessFlags.None);
-            ID3D11RenderTargetView target = image.Graphics.Device.CreateRenderTargetView(render, null);
-            ID3D11Texture2D staging = image.Graphics.Device.CreateTexture2D(
-                renderFormat, width, height, 1, 1, null,
-                BindFlags.None,
-                ResourceOptionFlags.None,
-                ResourceUsage.Staging,
-                CpuAccessFlags.Read);
-            try
-            {
-                image.Graphics.Context.OMSetRenderTargets(target, null);
-                image.Graphics.Context.ClearRenderTargetView(target, new Color4(0, 0, 0, 0));
-                image.Graphics.Context.RSSetViewports(new[] { new Viewport(0, 0, width, height) });
-                image.Graphics.Context.VSSetShader(_vertexShader);
-                image.Graphics.Context.PSSetShader(_pixelShader);
-                image.Graphics.Context.PSSetSamplers(0, new[] { _sampler });
-                image.Graphics.Context.PSSetConstantBuffers(0, new[] { _constants });
-                image.Graphics.Context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
-                foreach (long pageIndex in GetRequiredPages(image.Info, inverse, width, height))
-                {
-                    int firstLayer = _compose == null ? layerIndex : 0;
-                    int layerCount = _compose == null ? 1 : image.LayerNames.Count;
-                    var pages = new TileArrayPage[layerCount];
-                    for (int i = 0; i < layerCount; i++)
-                        pages[i] = image.GetLayer(firstLayer + i).GetOrCreatePage(pageIndex);
+        ID3D11Texture2D render = image.Graphics.Device.CreateTexture2D(
+            renderFormat, width, height, 1, 1, null,
+            BindFlags.RenderTarget,
+            ResourceOptionFlags.None,
+            ResourceUsage.Default,
+            CpuAccessFlags.None);
+        ID3D11RenderTargetView target = image.Graphics.Device.CreateRenderTargetView(render, null);
+        ID3D11Texture2D staging = image.Graphics.Device.CreateTexture2D(
+            renderFormat, width, height, 1, 1, null,
+            BindFlags.None,
+            ResourceOptionFlags.None,
+            ResourceUsage.Staging,
+            CpuAccessFlags.Read);
+        ID3D11DeviceContext context = image.Graphics.Context;
+        int boundResourceCount = 0;
+        try
+        {
+            context.OMSetRenderTargets(target, null);
+            context.ClearRenderTargetView(target, new Color4(0, 0, 0, 0));
+            context.RSSetViewports(new[] { new Viewport(0, 0, width, height) });
+            context.VSSetShader(_vertexShader);
+            context.PSSetShader(_pixelShader);
+            context.PSSetSamplers(0, new[] { _sampler });
+            context.PSSetConstantBuffers(0, new[] { _constants });
+            context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
+            if (!TryGetRequiredPages(image, userToGrothe, width, height, out List<long> requiredPages))
+                throw new ArgumentException("The transform matrix maps a corner of the rectangle to a point at infinity.", GpuImageProcessor.TransformParameterName);
 
-                    // The shader binds the layers as resource arrays: color and gray layers occupy
-                    // t0..t(n-1), YUV storage puts every luma plane first and every chroma plane after it.
-                    var resources = new List<ID3D11ShaderResourceView>(layerCount * 2);
-                    foreach (TileArrayPage page in pages)
-                        if (page.Color != null) resources.Add(page.Color.ShaderResourceView);
-                    foreach (TileArrayPage page in pages)
-                        if (page.Y != null) resources.Add(page.Y.ShaderResourceView);
-                    foreach (TileArrayPage page in pages)
-                        if (page.Uv != null) resources.Add(page.Uv.ShaderResourceView);
-
-                    float[] values = CreateConstants(inverse, image.Info, pageIndex * LayerStore.MaxArraySlices, pages[0].ArraySize);
-                    image.Graphics.Context.UpdateSubresource(values, _constants, 0, 0, 0, null);
-                    image.Graphics.Context.PSSetShaderResources(0, resources.ToArray());
-                    image.Graphics.Context.Draw(3, 0);
-                    image.Graphics.Context.PSSetShaderResources(0, new ID3D11ShaderResourceView[resources.Count]);
-                }
-                image.Graphics.Context.CopyResource(staging, render);
-                image.Graphics.Context.Flush();
-                Readback(image.Graphics.Context, staging, output, width, height, stride, format);
-            }
-            finally
+            // A compose binds only the layers its expression reads; the generated HLSL numbers them from 0.
+            IReadOnlyList<int> boundLayers = _compose == null ? new[] { layerIndex } : _compose.BoundLayerIndices;
+            var pages = new TileArrayPage[boundLayers.Count];
+            foreach (long pageIndex in requiredPages)
             {
-                staging.Dispose();
-                target.Dispose();
-                render.Dispose();
+                for (int i = 0; i < boundLayers.Count; i++)
+                    pages[i] = image.GetLayer(boundLayers[i]).GetOrCreatePage(pageIndex);
+
+                // The shader binds the layers as resource arrays: color and gray layers occupy
+                // t0..t(n-1), YUV storage puts every luma plane first and every chroma plane after it.
+                var resources = new List<ID3D11ShaderResourceView>(boundLayers.Count * 2);
+                foreach (TileArrayPage page in pages)
+                    if (page.Color != null) resources.Add(page.Color.ShaderResourceView);
+                foreach (TileArrayPage page in pages)
+                    if (page.Y != null) resources.Add(page.Y.ShaderResourceView);
+                foreach (TileArrayPage page in pages)
+                    if (page.Uv != null) resources.Add(page.Uv.ShaderResourceView);
+
+                float[] values = CreateConstants(userToGrothe, image.Info, pageIndex * LayerStore.MaxArraySlices, pages[0].ArraySize);
+                context.UpdateSubresource(values, _constants, 0, 0, 0, null);
+                context.PSSetShaderResources(0, resources.ToArray());
+                boundResourceCount = Math.Max(boundResourceCount, resources.Count);
+                context.Draw(3, 0);
             }
+            context.CopyResource(staging, render);
+            context.Flush();
+            Readback(context, staging, output, width, height, stride, format);
+        }
+        finally
+        {
+            // Nothing may stay bound to a resource that is about to be released.
+            if (boundResourceCount > 0)
+                context.PSSetShaderResources(0, new ID3D11ShaderResourceView[boundResourceCount]);
+            context.OMSetRenderTargets((ID3D11RenderTargetView)null, null);
+            staging.Dispose();
+            target.Dispose();
+            render.Dispose();
+        }
     }
 
     public void Dispose()
     {
-        _constants.Dispose();
-        _sampler.Dispose();
-        _pixelShader.Dispose();
-        _vertexShader.Dispose();
+        _constants?.Dispose();
+        _sampler?.Dispose();
+        _pixelShader?.Dispose();
+        _vertexShader?.Dispose();
     }
 
     /// <summary>
@@ -135,8 +149,10 @@ internal sealed class LoadProgram : IDisposable
 
     internal static IEnumerable<KeyValuePair<string, string>> BuildMacros(GrotheImage image, LayerCompose compose)
     {
-        // A plain load binds one layer and passes it through, a compose binds every layer of the image.
-        yield return new KeyValuePair<string, string>("LAYER_COUNT", (compose == null ? 1 : image.LayerNames.Count).ToString(CultureInfo.InvariantCulture));
+        // A plain load binds one layer and passes it through. A compose binds only the layers its
+        // expression actually reads, which are renumbered to 0..n-1 in the generated HLSL.
+        yield return new KeyValuePair<string, string>("LAYER_COUNT",
+            (compose == null ? 1 : compose.BoundLayerIndices.Count).ToString(CultureInfo.InvariantCulture));
         if (PixelFormatRules.IsYuv(image.Format)) yield return new KeyValuePair<string, string>("STORAGE_YUV", null);
         else if (image.Format == PixelFormat.Gray8) yield return new KeyValuePair<string, string>("STORAGE_GRAY", null);
         else yield return new KeyValuePair<string, string>("STORAGE_RGBA", null);
@@ -162,47 +178,41 @@ internal sealed class LoadProgram : IDisposable
         }
     }
 
-    private static float[] CreateConstants(TransformMatrix inverse, GrotheImageInfo info, long pageBase, int pageSize)
+    private static float[] CreateConstants(TransformMatrix userToGrothe, GrotheImageInfo info, long pageBase, int pageSize)
     {
         return new[]
         {
-            (float)inverse.M00, (float)inverse.M01, (float)inverse.M02, 0f,
-            (float)inverse.M10, (float)inverse.M11, (float)inverse.M12, 0f,
-            (float)inverse.M20, (float)inverse.M21, (float)inverse.M22, 0f,
+            (float)userToGrothe.M00, (float)userToGrothe.M01, (float)userToGrothe.M02, 0f,
+            (float)userToGrothe.M10, (float)userToGrothe.M11, (float)userToGrothe.M12, 0f,
+            (float)userToGrothe.M20, (float)userToGrothe.M21, (float)userToGrothe.M22, 0f,
             (float)info.StepX, (float)info.StepY, info.TileColumns, info.TileRows,
             (float)info.TileWidth, (float)info.TileHeight, info.TileOverlapX, info.TileOverlapY,
             info.Width, info.Height, pageBase, pageSize,
         };
     }
 
-    private static IEnumerable<long> GetRequiredPages(GrotheImageInfo info, TransformMatrix inverse, int outputWidth, int outputHeight)
+    /// <summary>
+    /// The texture array pages this draw can reach: the User Image rectangle mapped back into Grothe Image
+    /// space, reduced to the tiles the sampling ownership rule can select. Pages are visited in ascending
+    /// order so the draw order does not depend on hashing.
+    /// </summary>
+    private static bool TryGetRequiredPages(GrotheImage image, TransformMatrix userToGrothe, int outputWidth, int outputHeight, out List<long> pages)
     {
-        double minX = double.PositiveInfinity;
-        double minY = double.PositiveInfinity;
-        double maxX = double.NegativeInfinity;
-        double maxY = double.NegativeInfinity;
-        foreach (var point in new[]
+        if (!TileGrid.TryGetCoveredRegion(userToGrothe, outputWidth, outputHeight, out CoveredRegion region))
         {
-            inverse.TransformPoint(0, 0),
-            inverse.TransformPoint(outputWidth, 0),
-            inverse.TransformPoint(0, outputHeight),
-            inverse.TransformPoint(outputWidth, outputHeight),
-        })
-        {
-            minX = Math.Min(minX, point.X);
-            minY = Math.Min(minY, point.Y);
-            maxX = Math.Max(maxX, point.X);
-            maxY = Math.Max(maxY, point.Y);
+            pages = null;
+            return false;
         }
-        long firstColumn = TileGrid.Clamp((long)Math.Floor(minX / info.StepX) - 1, 0, info.TileColumns - 1);
-        long lastColumn = TileGrid.Clamp((long)Math.Floor(maxX / info.StepX) + 1, 0, info.TileColumns - 1);
-        long firstRow = TileGrid.Clamp((long)Math.Floor(minY / info.StepY) - 1, 0, info.TileRows - 1);
-        long lastRow = TileGrid.Clamp((long)Math.Floor(maxY / info.StepY) + 1, 0, info.TileRows - 1);
-        var pages = new HashSet<long>();
+
+        region.GetSamplingTileRange(image.Info, out long firstRow, out long lastRow, out long firstColumn, out long lastColumn);
+        var pageSet = new HashSet<long>();
         for (long row = firstRow; row <= lastRow; row++)
         for (long column = firstColumn; column <= lastColumn; column++)
-            pages.Add(TileGrid.GetLinearIndex(info, row, column) / LayerStore.MaxArraySlices);
-        return pages;
+            pageSet.Add(TileGrid.GetLinearIndex(image.Info, row, column) / LayerStore.MaxArraySlices);
+        var required = new List<long>(pageSet);
+        required.Sort();
+        pages = required;
+        return true;
     }
 
     private static DxgiFormat GetRenderFormat(PixelFormat format)
@@ -211,7 +221,8 @@ internal sealed class LoadProgram : IDisposable
         {
             case PixelFormat.Gray8: return DxgiFormat.R8_UNorm;
             case PixelFormat.Bgra32: return DxgiFormat.B8G8R8A8_UNorm;
-            default: return DxgiFormat.R8G8B8A8_UNorm;
+            case PixelFormat.Rgba32: return DxgiFormat.R8G8B8A8_UNorm;
+            default: throw new ArgumentException("Only Bgra32, Rgba32 and Gray8 are supported as output image formats.", nameof(format));
         }
     }
 

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using Vortice.Direct3D11;
 
@@ -12,6 +13,10 @@ internal interface IGrotheImageLoader
     GrotheImage Read(BinaryReader reader);
 }
 
+/// <summary>
+/// The versioned binary format of a Grothe Image: header, layer names and one record per written tile, each
+/// record holding the raw bytes of every storage plane of that tile.
+/// </summary>
 internal static class GrotheImageSerializer
 {
     private static readonly byte[] Magic = Encoding.ASCII.GetBytes("GROTHEIM");
@@ -43,28 +48,40 @@ internal static class GrotheImageSerializer
                     count = checked(count + image.GetLayer(layer).WrittenTiles.Count);
             writer.Write(count);
 
-            for (int layer = 0; image.HasTileStorage && layer < image.LayerNames.Count; layer++)
+            if (!image.HasTileStorage)
             {
-                var written = new List<long>(image.GetLayer(layer).WrittenTiles);
-                written.Sort();
-                foreach (long index in written)
+                writer.Flush();
+                return;
+            }
+
+            // One staging texture per plane shape is reused for every tile instead of allocating one per
+            // tile, which matters for images with thousands of tiles.
+            using (var staging = new StagingPool(image.Graphics))
+            {
+                for (int layer = 0; layer < image.LayerNames.Count; layer++)
                 {
-                    long row = index / info.TileColumns;
-                    long column = index % info.TileColumns;
-                    TileArrayPage page = image.GetLayer(layer).GetPageForTile(row, column, out int slice);
-                    writer.Write(layer);
-                    writer.Write(row);
-                    writer.Write(column);
-                    if (page.Color != null)
+                    var written = new List<long>(image.GetLayer(layer).WrittenTiles);
+                    written.Sort();
+                    foreach (long index in written)
                     {
-                        writer.Write((byte)1);
-                        WritePlane(writer, image.Graphics, page.Color, slice);
-                    }
-                    else
-                    {
-                        writer.Write((byte)2);
-                        WritePlane(writer, image.Graphics, page.Y, slice);
-                        WritePlane(writer, image.Graphics, page.Uv, slice);
+                        long row = index / info.TileColumns;
+                        long column = index % info.TileColumns;
+                        if (!image.GetLayer(layer).TryGetPageForTile(row, column, out TileArrayPage page, out int slice))
+                            throw new GrotheImageException("A tile is marked as written but its texture page is missing.");
+                        writer.Write(layer);
+                        writer.Write(row);
+                        writer.Write(column);
+                        if (page.Color != null)
+                        {
+                            writer.Write((byte)1);
+                            WritePlane(writer, image.Graphics, staging, page.Color, slice);
+                        }
+                        else
+                        {
+                            writer.Write((byte)2);
+                            WritePlane(writer, image.Graphics, staging, page.Y, slice);
+                            WritePlane(writer, image.Graphics, staging, page.Uv, slice);
+                        }
                     }
                 }
             }
@@ -94,7 +111,7 @@ internal static class GrotheImageSerializer
         return true;
     }
 
-    private static void WritePlane(BinaryWriter writer, D3D11DeviceContext graphics, TileArrayResource plane, int slice)
+    private static void WritePlane(BinaryWriter writer, D3D11DeviceContext graphics, StagingPool staging, TileArrayResource plane, int slice)
     {
         int rowBytes = checked(plane.Width * BytesPerTexel(plane.Format));
         int length = checked(rowBytes * plane.Height);
@@ -102,22 +119,48 @@ internal static class GrotheImageSerializer
         writer.Write(plane.Height);
         writer.Write(length);
 
-        using (ID3D11Texture2D staging = graphics.Device.CreateTexture2D(
-            plane.Format, plane.Width, plane.Height, 1, 1, null,
-            BindFlags.None, ResourceOptionFlags.None, ResourceUsage.Staging, CpuAccessFlags.Read))
+        ID3D11Texture2D texture = staging.Get(plane.Format, plane.Width, plane.Height);
+        graphics.Context.CopySubresourceRegion(texture, 0, 0, 0, 0, plane.Texture, slice, null);
+        MappedSubresource mapped = graphics.Context.Map(texture, 0, MapMode.Read, MapFlags.None);
+        try
         {
-            graphics.Context.CopySubresourceRegion(staging, 0, 0, 0, 0, plane.Texture, slice, null);
-            MappedSubresource mapped = graphics.Context.Map(staging, 0, MapMode.Read, MapFlags.None);
-            try
+            byte[] row = new byte[rowBytes];
+            for (int y = 0; y < plane.Height; y++)
             {
-                byte[] row = new byte[rowBytes];
-                for (int y = 0; y < plane.Height; y++)
-                {
-                    System.Runtime.InteropServices.Marshal.Copy(IntPtr.Add(mapped.DataPointer, checked(y * mapped.RowPitch)), row, 0, rowBytes);
-                    writer.Write(row);
-                }
+                Marshal.Copy(IntPtr.Add(mapped.DataPointer, checked(y * mapped.RowPitch)), row, 0, rowBytes);
+                writer.Write(row);
             }
-            finally { graphics.Context.Unmap(staging, 0); }
+        }
+        finally { graphics.Context.Unmap(texture, 0); }
+    }
+
+    /// <summary>Staging textures of a serialization, one per distinct plane shape, released with the write.</summary>
+    private sealed class StagingPool : IDisposable
+    {
+        private readonly D3D11DeviceContext _graphics;
+        private readonly Dictionary<string, ID3D11Texture2D> _textures = new Dictionary<string, ID3D11Texture2D>(StringComparer.Ordinal);
+
+        public StagingPool(D3D11DeviceContext graphics)
+        {
+            _graphics = graphics;
+        }
+
+        public ID3D11Texture2D Get(Vortice.DXGI.Format format, int width, int height)
+        {
+            string key = format + ":" + width + "x" + height;
+            ID3D11Texture2D texture;
+            if (_textures.TryGetValue(key, out texture)) return texture;
+            texture = _graphics.Device.CreateTexture2D(
+                format, width, height, 1, 1, null,
+                BindFlags.None, ResourceOptionFlags.None, ResourceUsage.Staging, CpuAccessFlags.Read);
+            _textures.Add(key, texture);
+            return texture;
+        }
+
+        public void Dispose()
+        {
+            foreach (ID3D11Texture2D texture in _textures.Values) texture.Dispose();
+            _textures.Clear();
         }
     }
 

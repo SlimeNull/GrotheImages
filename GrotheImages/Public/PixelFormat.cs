@@ -2,23 +2,34 @@ using System;
 
 namespace GrotheImages;
 
+/// <summary>
+/// Pixel layout of a User Image or of the tile storage of a Grothe Image. Only <see cref="Bgra32"/>,
+/// <see cref="Rgba32"/> and <see cref="Gray8"/> can be used as a transfer format; the YUV values describe
+/// the native two plane storage of a Grothe Image and are rejected by every transfer API.
+/// </summary>
 public enum PixelFormat
 {
+    /// <summary>8 bit BGRA, the layout of Windows bitmaps.</summary>
     Bgra32,
+
+    /// <summary>8 bit RGBA.</summary>
     Rgba32,
+
+    /// <summary>8 bit luminance, one channel.</summary>
     Gray8,
+
+    /// <summary>Full resolution Y and UV planes, BT.709 limited range.</summary>
     Yuv444,
+
+    /// <summary>Full resolution Y with horizontally halved chroma, BT.709 limited range.</summary>
     Yuv422,
+
+    /// <summary>Full resolution Y with horizontally and vertically halved chroma, BT.709 limited range.</summary>
     Yuv420,
 }
 
 internal static class PixelFormatRules
 {
-    public static bool IsSubsampledYuv(PixelFormat format)
-    {
-        return format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420;
-    }
-
     public static bool IsYuv(PixelFormat format)
     {
         return format == PixelFormat.Yuv444 || format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420;

@@ -12,7 +12,9 @@ public sealed class LayerComposeTests
 
     private static string GeneratedIncludes(GrotheImage image, string expression)
     {
-        return LoadProgram.BuildInclude(image, expression == null ? null : image.CreateLayerCompose(expression)).GeneratedSource;
+        if (expression == null) return LoadProgram.BuildInclude(image, null).GeneratedSource;
+        using (var compose = image.CreateLayerCompose(expression))
+            return LoadProgram.BuildInclude(image, compose).GeneratedSource;
     }
 
     [Fact]
@@ -205,16 +207,107 @@ public sealed class LayerComposeTests
     {
         using var image = CreateImage();
 
+        // Only layer 'a' is read, so the draw binds one layer instead of both.
         string macros = GeneratedIncludes(image, "a.rgb");
-        Assert.Contains("#define LAYER_COUNT 2", macros);
+        Assert.Contains("#define LAYER_COUNT 1", macros);
         Assert.Contains("#define STORAGE_RGBA", macros);
         Assert.Contains("#define COMPOSE_PIXEL layers[0].rgb, 1", macros);
+        Assert.Contains("#define LAYER_COUNT 2", GeneratedIncludes(image, "a.r, b.g"));
 
         using var gray = new GrotheImage(new GrotheImageInfo(64, 64, 64, 64), PixelFormat.Gray8, "a");
         Assert.Contains("#define STORAGE_GRAY", GeneratedIncludes(gray, "a.r"));
         Assert.Contains("#define LAYER_COUNT 1", GeneratedIncludes(gray, "a.r"));
         // A plain load passes the single bound layer through.
         Assert.Contains("#define COMPOSE_PIXEL layers[0]", GeneratedIncludes(gray, null));
+    }
+
+    [Fact]
+    public void OnlyTheLayersAnExpressionReadsAreBound()
+    {
+        using var image = CreateImage();
+
+        using (var first = image.CreateLayerCompose("a.r"))
+            Assert.Equal(new[] { 0 }, first.BoundLayerIndices);
+
+        // Reading only 'b' renumbers it to layers[0]: the shader never sees the image's layer indices.
+        using (var second = image.CreateLayerCompose("b.rg"))
+        {
+            Assert.Equal(new[] { 1 }, second.BoundLayerIndices);
+            Assert.Equal("layers[0].rg", second.ToHlsl());
+        }
+
+        using (var both = image.CreateLayerCompose("a.r, b.r"))
+        {
+            Assert.Equal(new[] { 0, 1 }, both.BoundLayerIndices);
+            Assert.Equal("float2(layers[0].r, layers[1].r)", both.ToHlsl());
+        }
+
+        // A member applied to a renumbered layer still compiles into a call on that layer.
+        using (var member = image.CreateLayerCompose("b.lum"))
+        {
+            Assert.Equal(new[] { 1 }, member.BoundLayerIndices);
+            Assert.Equal("lum(layers[0])", member.ToHlsl());
+        }
+    }
+
+    [Fact]
+    public void EveryReferencedLayerIsBoundNoMatterHowManyTheImageHas()
+    {
+        using var image = new GrotheImage(new GrotheImageInfo(64, 64, 64, 64), PixelFormat.Rgba32, "a", "b", "c", "d");
+
+        // A single reference in the middle of four layers.
+        using (var third = image.CreateLayerCompose("c.g"))
+        {
+            Assert.Equal(new[] { 2 }, third.BoundLayerIndices);
+            Assert.Equal("layers[0].g", third.ToHlsl());
+        }
+
+        // References out of order are bound in image order and renumbered accordingly.
+        using (var reversed = image.CreateLayerCompose("d.r, b.r"))
+        {
+            Assert.Equal(new[] { 1, 3 }, reversed.BoundLayerIndices);
+            Assert.Equal("float2(layers[1].r, layers[0].r)", reversed.ToHlsl());
+        }
+
+        // The same layer used twice is bound once.
+        using (var repeated = image.CreateLayerCompose("d.r, d.g, d.b, 1"))
+        {
+            Assert.Equal(new[] { 3 }, repeated.BoundLayerIndices);
+            Assert.Equal("float4(layers[0].r, layers[0].g, layers[0].b, 1)", repeated.ToHlsl());
+        }
+    }
+
+    [Fact]
+    public void AnExpressionWithoutLayersGetsOneDummyBinding()
+    {
+        using var image = CreateImage();
+        using var constant = image.CreateLayerCompose("0.5");
+
+        // A constant expression reads no layer, so a dummy binding keeps the generated resource array valid.
+        Assert.Equal(new[] { 0 }, constant.BoundLayerIndices);
+        Assert.Equal(1, constant.OutputChannelCount);
+        Assert.Contains("#define LAYER_COUNT 1", GeneratedIncludes(image, "0.5"));
+        Assert.Contains("#define COMPOSE_PIXEL 0.5, 0.5, 0.5, 1", GeneratedIncludes(image, "0.5"));
+    }
+
+    [Fact]
+    public void OperatorMismatchReportsTheCharacterPosition()
+    {
+        using var image = CreateImage();
+
+        FormatException mismatch = Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.rgb + b.gb"));
+        Assert.Contains("Position:", mismatch.Message);
+    }
+
+    [Fact]
+    public void NumbersAcceptExponentsAndStopAtASignThatIsAnOperator()
+    {
+        using var image = CreateImage();
+
+        Assert.Equal("(layers[0].r * 0.01)", image.CreateLayerCompose("a.r * 1e-2").ToHlsl());
+        Assert.Equal("(150 * layers[0].r)", image.CreateLayerCompose("1.5e+2 * a.r").ToHlsl());
+        // The minus after 'r' is a subtraction, not an exponent sign.
+        Assert.Equal("(layers[0].r - 2)", image.CreateLayerCompose("a.r-2").ToHlsl());
     }
 
     [Fact]

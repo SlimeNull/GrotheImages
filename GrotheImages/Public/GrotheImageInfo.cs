@@ -2,6 +2,15 @@ using System;
 
 namespace GrotheImages;
 
+/// <summary>
+/// Geometry of a Grothe Image: the equal-size tile grid, the overlap between neighbouring tiles and the
+/// logical size they add up to. The logical image is
+/// <c>TileWidth * TileColumns - (TileColumns - 1) * TileOverlapX</c> pixels wide (and the same for y).
+/// </summary>
+/// <remarks>
+/// The geometry is independent of <see cref="PixelFormat"/>; the storage format is supplied separately to
+/// <see cref="GrotheImage"/> and its alignment requirements are validated there.
+/// </remarks>
 public readonly struct GrotheImageInfo
 {
     public GrotheImageInfo(
@@ -17,21 +26,24 @@ public readonly struct GrotheImageInfo
 
         TileOverlapX = tileOverlapX;
         TileOverlapY = tileOverlapY;
-        TileColumns = FindColumns(width, maxTileWidth, tileOverlapX);
-        TileRows = FindColumns(height, maxTileHeight, tileOverlapY);
+        TileColumns = FindColumns(width, maxTileWidth, tileOverlapX, nameof(width));
+        TileRows = FindColumns(height, maxTileHeight, tileOverlapY, nameof(height));
         TileWidth = ComputeTileSize(width, TileColumns, tileOverlapX);
         TileHeight = ComputeTileSize(height, TileRows, tileOverlapY);
         ValidateComputedValues();
     }
 
+    /// <summary>
+    /// Builds the geometry from an explicit tile grid. <see cref="FromTiles"/> is the public way in; this
+    /// constructor skips the search for a tile size.
+    /// </summary>
     private GrotheImageInfo(
         int tileWidth,
         int tileHeight,
         long tileRows,
         long tileColumns,
         int tileOverlapX,
-        int tileOverlapY,
-        bool fromTileLayout)
+        int tileOverlapY)
     {
         TileWidth = tileWidth;
         TileHeight = tileHeight;
@@ -42,6 +54,11 @@ public readonly struct GrotheImageInfo
         ValidateComputedValues();
     }
 
+    /// <summary>
+    /// Describes a Grothe Image by its tile grid: <paramref name="tileRows"/> x <paramref name="tileColumns"/>
+    /// tiles of <paramref name="tileWidth"/> x <paramref name="tileHeight"/> pixels, overlapping by
+    /// <paramref name="tileOverlapX"/> / <paramref name="tileOverlapY"/>.
+    /// </summary>
     public static GrotheImageInfo FromTiles(
         int tileWidth,
         int tileHeight,
@@ -50,7 +67,7 @@ public readonly struct GrotheImageInfo
         int tileOverlapX = 0,
         int tileOverlapY = 0)
     {
-        return new GrotheImageInfo(tileWidth, tileHeight, tileRows, tileColumns, tileOverlapX, tileOverlapY, true);
+        return new GrotheImageInfo(tileWidth, tileHeight, tileRows, tileColumns, tileOverlapX, tileOverlapY);
     }
 
     public int TileWidth { get; }
@@ -60,12 +77,22 @@ public readonly struct GrotheImageInfo
     public int TileOverlapX { get; }
     public int TileOverlapY { get; }
 
+    /// <summary>Logical image width in pixels.</summary>
     public long Width => checked((long)TileWidth * TileColumns - (long)(TileColumns - 1) * TileOverlapX);
+
+    /// <summary>Logical image height in pixels.</summary>
     public long Height => checked((long)TileHeight * TileRows - (long)(TileRows - 1) * TileOverlapY);
 
+    /// <summary>Distance between the origins of two neighbouring tile columns.</summary>
     internal long StepX => TileWidth - TileOverlapX;
+
+    /// <summary>Distance between the origins of two neighbouring tile rows.</summary>
     internal long StepY => TileHeight - TileOverlapY;
 
+    /// <summary>
+    /// Rejects storage formats whose chroma planes need even tile geometry. The tile size itself is chosen
+    /// without knowing the format, so this is checked when the format becomes known.
+    /// </summary>
     internal void ValidateForFormat(PixelFormat format)
     {
         if (format == PixelFormat.Yuv422)
@@ -89,18 +116,46 @@ public readonly struct GrotheImageInfo
         if (overlap < 0 || overlap >= maxTile) throw new ArgumentOutOfRangeException(overlapName);
     }
 
-    private static long FindColumns(long length, int maxTile, int overlap)
+    /// <summary>
+    /// The number of equal-size tiles that covers <paramref name="length"/> with a tile no larger than
+    /// <paramref name="maxTile"/>, or throws when no such layout exists.
+    /// </summary>
+    /// <remarks>
+    /// Equal-size tiles mean the tile step has to divide <c>length - overlap</c> exactly, so the column
+    /// count must be a divisor of that span. The search picks the divisor closest above
+    /// <c>ceil(span / (maxTile - overlap))</c>, which is the largest tile that fits. A span whose divisors
+    /// are all far away from that bound - a prime span, for example - would otherwise turn into millions of
+    /// one-pixel tiles, so a layout whose tile is smaller than half of the requested maximum is rejected
+    /// instead of silently accepted. Callers that need such a size can pass the tile size they want
+    /// directly to <see cref="FromTiles"/>.
+    /// </remarks>
+    private static long FindColumns(long length, int maxTile, int overlap, string lengthName)
     {
-        long n = checked(length - overlap);
-        long minimumColumns = (n + (maxTile - overlap) - 1) / (maxTile - overlap);
-        for (long columns = Math.Max(1, minimumColumns); columns <= n; columns++)
+        long span = checked(length - overlap);
+        long maxStep = maxTile - overlap;
+        long minimumColumns = (span + maxStep - 1) / maxStep;
+        if (minimumColumns < 1) minimumColumns = 1;
+
+        // Every divisor of the span is a column count that splits it into equal tile steps. Trial division
+        // up to the square root visits them all, including the co-divisor, in O(sqrt(span)).
+        long best = 0;
+        for (long divisor = 1; divisor <= span / divisor; divisor++)
         {
-            if (n % columns == 0)
-                return columns;
-            if (columns > 10000000 && n > 10000000)
-                break;
+            if (span % divisor != 0) continue;
+            long coDivisor = span / divisor;
+            if (divisor >= minimumColumns && (best == 0 || divisor < best)) best = divisor;
+            if (coDivisor >= minimumColumns && (best == 0 || coDivisor < best)) best = coDivisor;
         }
-        throw new ArgumentException("The requested logical size cannot be represented by equal-size tiles and the supplied maximum tile size.");
+
+        if (best == 0)
+            throw new ArgumentException("A logical size of " + length + " cannot be covered by equal-size tiles of at most " + maxTile + " pixels.", lengthName);
+        if (span / best * 2 < maxStep)
+            throw new ArgumentException(
+                "A logical size of " + length + " with a maximum tile size of " + maxTile + " has no usable equal-size layout: "
+                + "the best split uses " + best + " tiles of " + (overlap + span / best) + " pixels, less than half of the maximum. "
+                + "Choose a maximum tile size whose divisors are closer to " + (span / minimumColumns + overlap) + " pixels, or use FromTiles.",
+                lengthName);
+        return best;
     }
 
     private static int ComputeTileSize(long length, long count, int overlap)

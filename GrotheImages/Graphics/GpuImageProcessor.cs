@@ -2,19 +2,34 @@ using System;
 
 namespace GrotheImages;
 
+/// <summary>
+/// The two image spaces of the engine:
+/// <list type="bullet">
+/// <item><description><b>User Image</b> - a rectangle of pixels in caller memory (<c>scan0</c>/<c>stride</c>).</description></item>
+/// <item><description><b>Grothe Image</b> - the tiled logical image a <see cref="GrotheImage"/> stores.</description></item>
+/// </list>
+/// <c>Update</c> moves a User Image into the Grothe Image, <c>Load</c> renders the Grothe Image into a User
+/// Image. Both take a transform in the direction the method names: <c>Update</c> takes User Image to Grothe
+/// Image, <c>Load</c> takes Grothe Image to User Image.
+/// </summary>
 internal static class GpuImageProcessor
 {
-    public static void Update(GrotheImage image, int layerIndex, nint scan0, int width, int height, int stride, PixelFormat format, TransformMatrix transform)
+    /// <summary>Name of the transform parameter of every public entry point that takes a matrix.</summary>
+    public const string TransformParameterName = "transformMatrix";
+
+    /// <summary>Copies a User Image into a layer of the Grothe Image using a User Image to Grothe Image transform.</summary>
+    public static void Update(GrotheImage image, int layerIndex, nint scan0, int width, int height, int stride, PixelFormat format, TransformMatrix userToGrothe)
     {
-        image.GetUpdateProgram().Execute(image, layerIndex, scan0, width, height, stride, format, transform);
+        image.GetUpdateProgram().Execute(image, layerIndex, scan0, width, height, stride, format, userToGrothe);
     }
 
-    public static void Load(GrotheImage image, int layerIndex, LayerCompose compose, nint scan0, int width, int height, int stride, PixelFormat format, TransformMatrix transform)
+    /// <summary>Renders a layer or a composition of the Grothe Image into a User Image using a Grothe Image to User Image transform.</summary>
+    public static void Load(GrotheImage image, int layerIndex, LayerCompose compose, nint scan0, int width, int height, int stride, PixelFormat format, TransformMatrix grotheToUser)
     {
-        if (!transform.TryInvert(out var inverse))
-            throw new ArgumentException("The transform matrix is not invertible.", nameof(transform));
+        if (!grotheToUser.IsFinite || !grotheToUser.TryInvert(out TransformMatrix userToGrothe))
+            throw new ArgumentException("The transform matrix must be finite and invertible.", TransformParameterName);
         (compose == null ? image.GetLoadProgram() : compose.GetLoadProgram())
-            .Execute(layerIndex, scan0, width, height, stride, format, inverse);
+            .Execute(layerIndex, scan0, width, height, stride, format, userToGrothe);
     }
 
     public static void BlendSeams(GrotheImage image)
@@ -35,5 +50,4 @@ internal static class GpuImageProcessor
 
         image.GetUpdateProgram().ExecuteTile(image, layerIndex, tileRow, tileColumn, scan0, width, height, stride, format);
     }
-
 }

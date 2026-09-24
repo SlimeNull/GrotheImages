@@ -1,11 +1,17 @@
-// Load pass: one full screen triangle that reads every layer of a GrotheImage and writes the requested
-// output pixel. Compiled for both the vertex and the pixel stage.
+// Load pass: one full screen triangle that reads every bound layer of a Grothe Image and writes the
+// requested User Image pixel. Compiled for both the vertex and the pixel stage.
 //
 // Macros generated for each compilation (see LoadProgram):
 //   LAYER_COUNT                     layers bound for this draw, 1 for a plain load
-//   STORAGE_RGBA/GRAY/YUV           storage format of the GrotheImage, exactly one is defined
+//   STORAGE_RGBA/GRAY/YUV           storage format of the Grothe Image, exactly one is defined
 //   MEMBER_LIBRARY                  defined when the expression calls into Shaders/Common.hlsl
 //   COMPOSE_PIXEL                   the compose expression, already padded to four channels
+//
+// Constants layout (cbuffer Params, six float4 = ShaderParameters.FloatCount floats):
+//   M0..M2      User Image -> Grothe Image transform (the inverse of the public Load matrix)
+//   Grid        StepX, StepY, TileColumns, TileRows
+//   Tile        TileWidth, TileHeight, TileOverlapX, TileOverlapY
+//   Image       Width, Height, page base slice, page slice count
 //
 // A Gray8 render target keeps red, so an expression with fewer than four channels is padded by
 // LoadProgram instead of by this shader.
@@ -42,10 +48,19 @@ VSOut VSMain(uint id : SV_VertexID)
     return o;
 }
 
-float2 Source(float2 p)
+// Turns a User Image pixel centre into a Grothe Image coordinate. False when the pixel has no image,
+// which happens on the horizon of a perspective transform.
+bool TryGrotheCoordinate(float2 user, out float2 grothe)
 {
-    float3 q = float3(dot(M0.xyz, float3(p, 1)), dot(M1.xyz, float3(p, 1)), dot(M2.xyz, float3(p, 1)));
-    return q.xy / q.z;
+    float3 q = float3(dot(M0.xyz, float3(user, 1)), dot(M1.xyz, float3(user, 1)), dot(M2.xyz, float3(user, 1)));
+    grothe = float2(0, 0);
+    // A homogeneous divisor at (or next to) zero has no image, and a NaN divisor slips through every
+    // comparison below, so both are rejected here. This matches TransformMatrix.TryTransformPoint.
+    if (!(abs(q.z) > 1e-15)) return false;
+    float2 candidate = q.xy / q.z;
+    if (any(isnan(candidate))) return false;
+    grothe = candidate;
+    return true;
 }
 
 // The logical channels of one layer: RGB storage keeps R/G/B/A, Gray8 returns v/v/v/1 and YUV returns
@@ -67,10 +82,11 @@ float4 ReadLayer(int index, float2 uv, int slice)
 float4 ToOutput(float4 value)
 {
 #if defined(STORAGE_YUV)
-    // BT.709 limited range YUV -> RGB, the requested output formats are always RGB or Gray.
-    float yy = (value.x - 0.0625) * 1.1643836;
-    float uu = value.y - 0.5;
-    float vv = value.z - 0.5;
+    // BT.709 limited range YUV -> RGB, the inverse of Update.hlsl's ToYuv. The requested output formats are
+    // always RGB or Gray, so the result gets an opaque alpha.
+    float yy = (value.x - 0.0627451) * 1.1643836;
+    float uu = value.y - 0.5019608;
+    float vv = value.z - 0.5019608;
     return float4(yy + 1.7927415 * vv, yy - 0.2132486 * uu - 0.5329093 * vv, yy + 2.1124018 * uu, 1);
 #else
     return value;
@@ -79,8 +95,9 @@ float4 ToOutput(float4 value)
 
 float4 PSMain(VSOut input) : SV_Target
 {
-    float2 source = Source(input.Position.xy);
-    if (source.x < 0 || source.y < 0 || source.x >= Image.x || source.y >= Image.y) return float4(0, 0, 0, 0);
+    float2 source;
+    if (!TryGrotheCoordinate(input.Position.xy, source)) return float4(0, 0, 0, 0);
+    if (!all(source >= 0) || !all(source < Image.xy)) return float4(0, 0, 0, 0);
 
     int column = clamp((int)floor((source.x - 0.5 * Tile.z) / Grid.x), 0, (int)Grid.z - 1);
     int row = clamp((int)floor((source.y - 0.5 * Tile.w) / Grid.y), 0, (int)Grid.w - 1);

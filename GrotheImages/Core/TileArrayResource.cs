@@ -4,9 +4,14 @@ using DxgiFormat = Vortice.DXGI.Format;
 
 namespace GrotheImages;
 
+/// <summary>
+/// One <c>Texture2DArray</c> plane of a tile page together with the views the pipeline binds. Tiles are
+/// written through unordered access views and read through shader resource views, so both bindings are
+/// created together.
+/// </summary>
 internal sealed class TileArrayResource : IDisposable
 {
-    public TileArrayResource(D3D11DeviceContext graphics, DxgiFormat format, int width, int height, int arraySize, bool renderTarget)
+    public TileArrayResource(D3D11DeviceContext graphics, DxgiFormat format, int width, int height, int arraySize)
     {
         if (arraySize <= 0) throw new ArgumentOutOfRangeException(nameof(arraySize));
         Texture = graphics.Device.CreateTexture2D(
@@ -16,7 +21,7 @@ internal sealed class TileArrayResource : IDisposable
             arraySize,
             1,
             null,
-            renderTarget ? BindFlags.ShaderResource | BindFlags.RenderTarget : BindFlags.ShaderResource | BindFlags.UnorderedAccess,
+            BindFlags.ShaderResource | BindFlags.UnorderedAccess,
             ResourceOptionFlags.None,
             ResourceUsage.Default,
             CpuAccessFlags.None);

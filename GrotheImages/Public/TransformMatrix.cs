@@ -50,26 +50,44 @@ public readonly record struct TransformMatrix(
         return inverse.IsFinite;
     }
 
+    /// <summary>
+    /// Transforms one point. Throws when the homogeneous divisor of that point is degenerate, which happens
+    /// for the points at infinity of a perspective transform.
+    /// </summary>
     public (double X, double Y) TransformPoint(double x, double y)
     {
-        double w = M20 * x + M21 * y + M22;
-        double tx = M00 * x + M01 * y + M02;
-        double ty = M10 * x + M11 * y + M12;
-        if (!IsFiniteValue(w) || Math.Abs(w) < 1e-15)
+        if (!TryTransformPoint(x, y, out double transformedX, out double transformedY))
             throw new InvalidOperationException("The transformed homogeneous coordinate is invalid.");
-        return (tx / w, ty / w);
+        return (transformedX, transformedY);
     }
 
-    internal float[] ToFloatArray()
+    /// <summary>
+    /// Transforms one point, returning <c>false</c> instead of throwing when the homogeneous divisor of that
+    /// point is zero or not a number. Callers that transform a whole rectangle use this so a degenerate
+    /// corner becomes an argument error rather than an exception from deep inside the render pipeline.
+    /// </summary>
+    public bool TryTransformPoint(double x, double y, out double transformedX, out double transformedY)
+        => TryTransformPoint(x, y, out transformedX, out transformedY, out _);
+
+    /// <summary>
+    /// Same as the public overload but also reports the homogeneous divisor, which callers that map a whole
+    /// rectangle use to tell which side of the horizon every corner is on.
+    /// </summary>
+    internal bool TryTransformPoint(double x, double y, out double transformedX, out double transformedY, out double divisor)
     {
-        if (!IsFinite)
-            throw new ArgumentException("The transform matrix must contain only finite values.", nameof(TransformMatrix));
-        return new[]
+        divisor = M20 * x + M21 * y + M22;
+        double tx = M00 * x + M01 * y + M02;
+        double ty = M10 * x + M11 * y + M12;
+        if (!IsFiniteValue(divisor) || Math.Abs(divisor) < 1e-15)
         {
-            (float)M00, (float)M01, (float)M02,
-            (float)M10, (float)M11, (float)M12,
-            (float)M20, (float)M21, (float)M22,
-        };
+            transformedX = 0;
+            transformedY = 0;
+            return false;
+        }
+
+        transformedX = tx / divisor;
+        transformedY = ty / divisor;
+        return IsFiniteValue(transformedX) && IsFiniteValue(transformedY);
     }
 
     public override string ToString()

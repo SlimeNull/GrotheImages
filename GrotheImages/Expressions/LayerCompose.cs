@@ -7,29 +7,41 @@ using System.Text;
 
 namespace GrotheImages;
 
+/// <summary>
+/// A compiled channel expression over the layers of one <see cref="GrotheImage"/>, used to render several
+/// layers into one User Image pixel. The compiled form is immutable and can be rendered repeatedly.
+/// </summary>
 public sealed class LayerCompose : IDisposable
 {
     private LoadProgram _loadProgram;
     private GrotheImage _owner;
     private bool _disposed;
-    internal LayerCompose(string expression, ExpressionNode root, IReadOnlyCollection<int> referencedLayers, bool usesMemberExpression)
+    internal LayerCompose(string expression, ExpressionNode root, IReadOnlyList<int> boundLayers, bool usesMemberExpression)
     {
         Expression = expression;
         Root = root;
-        ReferencedLayerIndices = new ReadOnlyCollection<int>(referencedLayers.ToList());
+        BoundLayerIndices = new ReadOnlyCollection<int>(boundLayers.ToList());
         OutputChannelCount = root.Width;
         UsesMemberExpression = usesMemberExpression;
     }
 
+    /// <summary>The expression this composition was compiled from.</summary>
     public string Expression { get; }
+
+    /// <summary>Number of channels the expression produces, between 1 and 4.</summary>
     public int OutputChannelCount { get; }
 
     /// <summary>True when the expression calls into <c>Shaders/Common.hlsl</c>, which is then compiled into the shader.</summary>
     internal bool UsesMemberExpression { get; }
 
     internal ExpressionNode Root { get; }
-    internal ReadOnlyCollection<int> ReferencedLayerIndices { get; }
-    internal GrotheImage Owner => _disposed ? null : _owner;
+
+    /// <summary>
+    /// The layers of the owning image this composition reads, in the order the generated shader binds them.
+    /// Only these layers are uploaded to the pixel shader and only these get their pages allocated; the
+    /// expression refers to them as <c>layers[0]</c> .. <c>layers[n-1]</c>.
+    /// </summary>
+    internal ReadOnlyCollection<int> BoundLayerIndices { get; }
 
     internal void Attach(GrotheImage owner) => _owner = owner;
 
@@ -47,6 +59,7 @@ public sealed class LayerCompose : IDisposable
         _owner = null;
     }
 
+    /// <summary>Releases the pixel shader compiled for this composition; the owning image stays alive.</summary>
     public void Dispose()
     {
         GrotheImage owner = _owner;
@@ -108,16 +121,10 @@ internal sealed class ExpressionLexer
 
         int start = _position;
         char c = _text[_position++];
-        if (c == '.' && _position < _text.Length && char.IsDigit(_text[_position]))
-        {
-            while (_position < _text.Length && (char.IsDigit(_text[_position]) || _text[_position] == 'e' || _text[_position] == 'E' || _text[_position] == '+' || _text[_position] == '-'))
-            {
-                char next = _text[_position];
-                if ((next == '+' || next == '-') && _text[_position - 1] != 'e' && _text[_position - 1] != 'E') break;
-                _position++;
-            }
-            return new ExpressionToken(ExpressionTokenKind.Number, _text.Substring(start, _position - start), start);
-        }
+        // A number starts with a digit, or with a dot that is followed by one. Everything else falls
+        // through to the punctuator and identifier cases below.
+        if (char.IsDigit(c) || (c == '.' && _position < _text.Length && char.IsDigit(_text[_position])))
+            return new ExpressionToken(ExpressionTokenKind.Number, ReadNumber(start), start);
 
         switch (c)
         {
@@ -137,18 +144,32 @@ internal sealed class ExpressionLexer
             return new ExpressionToken(ExpressionTokenKind.Identifier, _text.Substring(start, _position - start), start);
         }
 
-        if (char.IsDigit(c) || c == '.')
-        {
-            while (_position < _text.Length && (char.IsDigit(_text[_position]) || _text[_position] == '.' || _text[_position] == 'e' || _text[_position] == 'E' || _text[_position] == '+' || _text[_position] == '-'))
-            {
-                char next = _text[_position];
-                if ((next == '+' || next == '-') && _position > start && _text[_position - 1] != 'e' && _text[_position - 1] != 'E') break;
-                _position++;
-            }
-            return new ExpressionToken(ExpressionTokenKind.Number, _text.Substring(start, _position - start), start);
-        }
-
         throw Error("Unexpected character '" + c + "'.", start);
+    }
+
+    /// <summary>
+    /// Consumes the rest of a number starting at <paramref name="start"/>: digits, one or more dots, an
+    /// exponent marker and the sign directly behind it. Anything else ends the number, so <c>1-2</c> is a
+    /// subtraction while <c>1e-2</c> is one constant.
+    /// </summary>
+    private string ReadNumber(int start)
+    {
+        while (_position < _text.Length)
+        {
+            char next = _text[_position];
+            if (char.IsDigit(next) || next == '.' || next == 'e' || next == 'E')
+            {
+                _position++;
+                continue;
+            }
+            if ((next == '+' || next == '-') && (_text[_position - 1] == 'e' || _text[_position - 1] == 'E'))
+            {
+                _position++;
+                continue;
+            }
+            break;
+        }
+        return _text.Substring(start, _position - start);
     }
 
     private FormatException Error(string message, int position)
@@ -178,6 +199,23 @@ internal abstract class ExpressionNode
     public ExpressionType Type { get; }
     public int Width => Type.Width;
     public abstract string ToHlsl();
+
+    /// <summary>
+    /// Rewrites every layer reference to its position inside <paramref name="boundLayers"/>. A load binds
+    /// only the layers an expression reads, so the generated HLSL numbers them from zero; without this the
+    /// shader would index a resource array that is shorter than the image's layer list.
+    /// </summary>
+    internal virtual void RemapLayers(IReadOnlyList<int> boundLayers)
+    {
+    }
+
+    /// <summary>The position of an image layer inside the bound layer list.</summary>
+    protected static int IndexOfLayer(IReadOnlyList<int> boundLayers, int layerIndex)
+    {
+        for (int i = 0; i < boundLayers.Count; i++)
+            if (boundLayers[i] == layerIndex) return i;
+        throw new GrotheImageException("A layer reference was not bound to the composition.");
+    }
 }
 
 internal sealed class ConstantExpression : ExpressionNode
@@ -198,9 +236,11 @@ internal sealed class LayerExpression : ExpressionNode
         LayerIndex = layerIndex;
     }
 
-    public int LayerIndex { get; }
+    /// <summary>Index into the bound layer array of the generated shader, not into <c>GrotheImage.LayerNames</c>.</summary>
+    public int LayerIndex { get; private set; }
 
-    // The generated Compose() function receives every sampled layer as an array.
+    internal override void RemapLayers(IReadOnlyList<int> boundLayers) => LayerIndex = IndexOfLayer(boundLayers, LayerIndex);
+
     public override string ToHlsl() => "layers[" + LayerIndex + "]";
 }
 
@@ -214,6 +254,8 @@ internal sealed class SwizzleExpression : ExpressionNode
 
     public ExpressionNode Operand { get; }
     public string Swizzle { get; }
+
+    internal override void RemapLayers(IReadOnlyList<int> boundLayers) => Operand.RemapLayers(boundLayers);
 
     public override string ToHlsl()
     {
@@ -241,6 +283,12 @@ internal sealed class MemberExpression : ExpressionNode
     public string Name { get; }
     public ExpressionNode Operand { get; }
     public IReadOnlyList<ExpressionNode> Arguments { get; }
+
+    internal override void RemapLayers(IReadOnlyList<int> boundLayers)
+    {
+        Operand.RemapLayers(boundLayers);
+        for (int i = 0; i < Arguments.Count; i++) Arguments[i].RemapLayers(boundLayers);
+    }
 
     public override string ToHlsl()
     {
@@ -274,6 +322,11 @@ internal sealed class CompositionExpression : ExpressionNode
 
     public IReadOnlyList<ExpressionNode> Operands { get; }
 
+    internal override void RemapLayers(IReadOnlyList<int> boundLayers)
+    {
+        for (int i = 0; i < Operands.Count; i++) Operands[i].RemapLayers(boundLayers);
+    }
+
     public override string ToHlsl()
     {
         var b = new StringBuilder("float").Append(Width).Append('(');
@@ -296,6 +349,9 @@ internal sealed class UnaryExpression : ExpressionNode
 
     public char Operation { get; }
     public ExpressionNode Operand { get; }
+
+    internal override void RemapLayers(IReadOnlyList<int> boundLayers) => Operand.RemapLayers(boundLayers);
+
     public override string ToHlsl() => "(" + Operation + Operand.ToHlsl() + ")";
 }
 
@@ -311,6 +367,13 @@ internal sealed class BinaryExpression : ExpressionNode
     public char Operation { get; }
     public ExpressionNode Left { get; }
     public ExpressionNode Right { get; }
+
+    internal override void RemapLayers(IReadOnlyList<int> boundLayers)
+    {
+        Left.RemapLayers(boundLayers);
+        Right.RemapLayers(boundLayers);
+    }
+
     public override string ToHlsl() => "(" + Left.ToHlsl() + " " + Operation + " " + Right.ToHlsl() + ")";
 }
 
@@ -321,7 +384,13 @@ internal static class ExpressionCompiler
         if (string.IsNullOrWhiteSpace(expression)) throw new ArgumentException("Expression cannot be empty.", nameof(expression));
         var parser = new ExpressionParser(expression, layerNames);
         ExpressionNode root = parser.Parse();
-        return new LayerCompose(expression, root, parser.ReferencedLayers, parser.UsesMemberExpression);
+        // Only the layers the expression reads are bound to the shader, renumbered from zero in image
+        // order. An expression that reads no layer at all still gets one dummy binding, so the generated
+        // resource array is never empty.
+        List<int> boundLayers = parser.ReferencedLayers.OrderBy(x => x).ToList();
+        if (boundLayers.Count == 0) boundLayers.Add(0);
+        root.RemapLayers(boundLayers);
+        return new LayerCompose(expression, root, boundLayers, parser.UsesMemberExpression);
     }
 
     private sealed class ExpressionParser
@@ -381,9 +450,10 @@ internal static class ExpressionCompiler
             ExpressionNode left = ParseMultiplicative();
             while (_current.Kind == ExpressionTokenKind.Plus || _current.Kind == ExpressionTokenKind.Minus)
             {
-                char op = _current.Kind == ExpressionTokenKind.Plus ? '+' : '-';
+                ExpressionToken token = _current;
+                char op = token.Kind == ExpressionTokenKind.Plus ? '+' : '-';
                 Advance();
-                left = MakeBinary(op, left, ParseMultiplicative());
+                left = MakeBinary(op, left, ParseMultiplicative(), token);
             }
             return left;
         }
@@ -393,9 +463,10 @@ internal static class ExpressionCompiler
             ExpressionNode left = ParseUnary();
             while (_current.Kind == ExpressionTokenKind.Star || _current.Kind == ExpressionTokenKind.Slash)
             {
-                char op = _current.Kind == ExpressionTokenKind.Star ? '*' : '/';
+                ExpressionToken token = _current;
+                char op = token.Kind == ExpressionTokenKind.Star ? '*' : '/';
                 Advance();
-                left = MakeBinary(op, left, ParseUnary());
+                left = MakeBinary(op, left, ParseUnary(), token);
             }
             return left;
         }
@@ -559,10 +630,10 @@ internal static class ExpressionCompiler
             return new MemberExpression(token.Text, operand, arguments, selected.Value);
         }
 
-        private static ExpressionNode MakeBinary(char operation, ExpressionNode left, ExpressionNode right)
+        private ExpressionNode MakeBinary(char operation, ExpressionNode left, ExpressionNode right, ExpressionToken token)
         {
             if (left.Width != right.Width && left.Width != 1 && right.Width != 1)
-                throw new FormatException("Vector operands must have the same width; scalar broadcasting is the only implicit conversion.");
+                throw Error("Vector operands must have the same width; scalar broadcasting is the only implicit conversion.", token);
             return new BinaryExpression(operation, left, right, new ExpressionType(Math.Max(left.Width, right.Width)));
         }
 
