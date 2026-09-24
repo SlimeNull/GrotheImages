@@ -490,11 +490,54 @@ public sealed class GpuIntegrationTests
         }
     }
 
-    private static GrotheImage CreateGpuImage(PixelFormat format, int width, int height)
+    [Fact]
+    public void ReferenceStyleExpressionsRunInThePixelShader()
+    {
+        IntPtr outputPtr = Marshal.AllocHGlobal(4);
+        IntPtr aPtr = Marshal.AllocHGlobal(4);
+        IntPtr bPtr = Marshal.AllocHGlobal(4);
+        try
+        {
+            Marshal.Copy(new byte[] { 50, 100, 150, 255 }, 0, aPtr, 4);
+            Marshal.Copy(new byte[] { 100, 0, 0, 255 }, 0, bPtr, 4);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, 1, 1, "a", "b");
+            image.UpdateTile(0, 0, 0, aPtr, 1, 1, 4, PixelFormat.Rgba32);
+            image.UpdateTile(1, 0, 0, bPtr, 1, 1, 4, PixelFormat.Rgba32);
+
+            void AssertPixel(string expression, params byte[] expected)
+            {
+                using (var compose = image.CreateLayerCompose(expression))
+                    image.Load(compose, outputPtr, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+                byte[] result = new byte[4];
+                Marshal.Copy(outputPtr, result, 0, 4);
+                for (int i = 0; i < 4; i++) Assert.InRange(result[i], (byte)Math.Max(0, expected[i] - 2), (byte)Math.Min(255, expected[i] + 2));
+            }
+
+            // A replicated swizzle composes into the channels in order.
+            AssertPixel("a.rr, a.rr", 50, 50, 50, 50);
+            // The reference engine's top.lum|side.lum|(top.lum+side.lum)/2, with '|' written as ','.
+            // a.lum = 90.75, b.lum = 29.9, average = 60.3
+            AssertPixel("a.lum, b.lum, (a.lum+b.lum)/2", 91, 30, 60, 255);
+            // A grouped expression can feed a member.
+            AssertPixel("(a.rgb).lum, (a.rgb).lum, (a.rgb).lum, 1", 91, 91, 91, 255);
+            // HLSL intrinsics such as abs/sqrt/length are available like in the reference engine.
+            AssertPixel("a.rgb.abs", 50, 100, 150, 255);
+            AssertPixel("a.rgb.sqrt", 113, 160, 196, 255);
+            AssertPixel("a.rgb.length", 187, 187, 187, 255);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(outputPtr);
+            Marshal.FreeHGlobal(aPtr);
+            Marshal.FreeHGlobal(bPtr);
+        }
+    }
+
+    private static GrotheImage CreateGpuImage(PixelFormat format, int width, int height, params string[] layers)
     {
         try
         {
-            return new GrotheImage(new GrotheImageInfo(width, height, width, height), format, "a");
+            return new GrotheImage(new GrotheImageInfo(width, height, width, height), format, layers.Length == 0 ? new[] { "a" } : layers);
         }
         catch (Exception ex) when (ex is GrotheImageException || ex is DllNotFoundException || ex is TypeInitializationException)
         {

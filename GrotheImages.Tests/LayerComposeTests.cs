@@ -37,7 +37,116 @@ public sealed class LayerComposeTests
     {
         using var image = CreateImage();
         Assert.Throws<FormatException>(() => image.CreateLayerCompose("c.r"));
-        Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.rr"));
+        Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.q"));
+        // A swizzle may not select channels the operand does not have, nor more than four channels.
+        Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.rgb.a"));
+        Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.rrrrr"));
+    }
+
+    [Fact]
+    public void SwizzlesAcceptAnyChannelCombinationLikeTheReferenceEngine()
+    {
+        using var image = CreateImage();
+
+        // Holly.Imaging.DX formats swizzles from a ^(r|g|b|a)+$ name, so 'bgr' and 'rr' are valid there.
+        Assert.Equal("layers[0].bgr", image.CreateLayerCompose("a.bgr").ToHlsl());
+        Assert.Equal(3, image.CreateLayerCompose("a.bgr").OutputChannelCount);
+        Assert.Equal(2, image.CreateLayerCompose("a.rr").OutputChannelCount);
+        Assert.Equal(1, image.CreateLayerCompose("a.a").OutputChannelCount);
+        Assert.Equal(4, image.CreateLayerCompose("a.rgba").OutputChannelCount);
+    }
+
+    [Fact]
+    public void ABareLayerIsTheWholeLayer()
+    {
+        using var image = CreateImage();
+
+        // The reference engine allows a bare source name; ours is the four logical channels.
+        Assert.Equal(4, image.CreateLayerCompose("a").OutputChannelCount);
+        Assert.Equal("((layers[0] * 1.2) - 0.1)", image.CreateLayerCompose("a*1.2-0.1").ToHlsl());
+    }
+
+    [Fact]
+    public void CompositionIsAnOperatorThatCanBeGroupedAndPipedIntoAMember()
+    {
+        using var image = CreateImage();
+
+        // ',' concatenates channels, like the reference engine's '|'.
+        Assert.Equal("float3(layers[0].r, layers[1].gb)", image.CreateLayerCompose("a.r, b.gb").ToHlsl());
+        Assert.Equal(3, image.CreateLayerCompose("a.r, b.gb").OutputChannelCount);
+        // Grouped composition is a value, so it can feed a member.
+        var grouped = image.CreateLayerCompose("(a.lum, b.lum).avg");
+        Assert.Equal(1, grouped.OutputChannelCount);
+        Assert.Equal("avg(float2(lum(layers[0]), lum(layers[1])))", grouped.ToHlsl());
+        Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.rgba, b.rgba"));
+    }
+
+    [Fact]
+    public void IntrinsicFunctionsBehaveLikeTheReferenceEngine()
+    {
+        using var image = CreateImage();
+
+        Assert.Equal("sqrt(layers[0])", image.CreateLayerCompose("a.sqrt").ToHlsl());
+        Assert.Equal(3, image.CreateLayerCompose("a.rgb.abs").OutputChannelCount);
+        Assert.Equal(1, image.CreateLayerCompose("a.length").OutputChannelCount);
+        Assert.Equal("length(layers[0].rgb)", image.CreateLayerCompose("a.rgb.length").ToHlsl());
+        // Intrinsics are HLSL builtins, so they do not pull in Shaders/Common.hlsl.
+        Assert.False(image.CreateLayerCompose("a.r.sqrt, a.r.abs, a.r.sign, a.r.length").UsesMemberExpression);
+        Assert.True(image.CreateLayerCompose("a.lum").UsesMemberExpression);
+    }
+
+    [Fact]
+    public void EveryReferenceEngineFunctionIsAvailable()
+    {
+        using var image = CreateImage();
+
+        // IHLManager.RegisterFilters / RegisterIntrinsicFunctions in Holly.Imaging.DX.
+        string[] filters =
+        {
+            "lum", "distance", "hhh", "bin", "bin2", "color", "hsv", "min", "max", "product", "sum", "avg",
+            "sort", "mul_rgb_to_a", "rgb_to_xyz", "xyz_to_rgb", "rgb_to_luv", "luv_to_rgb", "xyz_to_luv",
+            "luv_to_xyz", "sharpen",
+        };
+        string[] intrinsics = { "abs", "length", "saturate", "sqrt", "sign" };
+
+        foreach (string name in filters)
+            Assert.True(ShaderLibrary.TryGetMember(name, out _), "missing filter: " + name);
+        foreach (string name in intrinsics)
+            Assert.True(ShaderLibrary.TryGetMember(name, out _), "missing intrinsic: " + name);
+
+        // Unlike the reference engine, the threshold functions can actually be called with arguments there.
+        Assert.Equal("bin2(layers[0], (float4)(0.2), (float4)(0.8))", image.CreateLayerCompose("a.bin2(0.2, 0.8)").ToHlsl());
+    }
+
+    [Fact]
+    public void ReferenceExpressionsWorkAfterReplacingThePipeOperatorWithAComma()
+    {
+        using var image = CreateImage();
+
+        // Production expressions from Holly.AOI (InspectionWindow.ImageSourceOldToNew), with '|' written
+        // as ',' and the reference source names top/side mapped onto our layers.
+        string[] expressions =
+        {
+            "a", "b",
+            "a.lum", "1-a.lum", "a.lum*2-1", "a.lum*2",
+            "a.lum, b.lum", "a.lum, b.lum, (a.lum+b.lum)/2",
+            "(a.lum-b.lum)/2+0.5", "(b.lum-a.lum)/2+0.5",
+            "(a.lum+b.lum)/2", "1-(a.lum+b.lum)/2", "1-b.lum", "b.lum",
+            "b", "b*1.2-0.1", "a*1.2-0.1",
+            "a.bgr", "(a.rgb).lum",
+        };
+        int[] channels = { 4, 4, 1, 1, 1, 1, 2, 3, 1, 1, 1, 1, 1, 1, 4, 4, 4, 3, 1 };
+
+        for (int i = 0; i < expressions.Length; i++)
+        {
+            var compose = image.CreateLayerCompose(expressions[i]);
+            Assert.Equal(channels[i], compose.OutputChannelCount);
+        }
+
+        // Spot check the generated HLSL of a composed expression.
+        Assert.Equal(
+            "float3(lum(layers[0]), lum(layers[1]), ((lum(layers[0]) + lum(layers[1])) / 2))",
+            image.CreateLayerCompose("a.lum, b.lum, (a.lum+b.lum)/2").ToHlsl());
     }
 
     [Fact]
@@ -119,8 +228,9 @@ public sealed class LayerComposeTests
         Assert.Equal("layers[0].gb, 0, 1", Expression("a.gb"));
         // One channel is replicated across red, green and blue with alpha of one.
         Assert.Equal("lum(layers[0]), lum(layers[0]), lum(layers[0]), 1", Expression("a.lum"));
-        // Channels mean nothing by themselves: only the position in the result list matters.
-        Assert.Equal("layers[0].a, layers[0].r, layers[0].g, layers[0].b", Expression("a.a, a.r, a.g, a.b"));
+        // A composition already produces a complete value, so only the missing channels are added.
+        Assert.Equal("float4(layers[0].a, layers[0].r, layers[0].g, layers[0].b)", Expression("a.a, a.r, a.g, a.b"));
+        Assert.Equal("float2(layers[0].r, layers[1].g), 0, 1", Expression("a.r, b.g"));
     }
 
     [Fact]

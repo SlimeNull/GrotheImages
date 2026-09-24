@@ -426,17 +426,18 @@ public sealed class LayerCompose
 ### 7.2 第一版语法
 
 ```text
-compose       := expression (',' expression)*
-expression    := additive
+compose       := expression
+expression    := composition
+composition   := additive (',' additive)*
 additive      := multiplicative (('+' | '-') multiplicative)*
 multiplicative:= unary (('*' | '/') unary)*
 unary         := ('+' | '-') unary | primary
 primary       := number | '(' expression ')' | reference
-reference     := identifier accessor+
+reference     := identifier accessor*
 accessor      := '.' swizzle | '.' member arguments?
 member        := identifier
-arguments     := '(' expression (',' expression)* ')'
-swizzle       := 'r' | 'g' | 'b' | 'a' | 'rg' | 'gb' | 'rgb' | 'rgba'
+arguments     := '(' additive (',' additive)* ')'
+swizzle       := ('r' | 'g' | 'b' | 'a'){1,4}
 ```
 
 语义规则：
@@ -445,10 +446,12 @@ swizzle       := 'r' | 'g' | 'b' | 'a' | 'rg' | 'gb' | 'rgb' | 'rgba'
 - 标量与向量运算按标量广播；相同维度向量逐分量运算。
 - 两个不同维度的向量不隐式扩展，避免 `rgb + gb` 产生不明确结果。
 - 乘法和除法是逐分量运算，不支持矩阵乘法或 dot product。
-- 逗号分隔的结果会把每个标量/向量结果按顺序展开，因此 `a.r, b.gb` 是 3 个输出通道。表达式通道数不足 4 时按固定规则补成完整像素：3 通道 → `(x, y, z, 1)`，2 通道 → `(x, y, 0, 1)`，1 通道 → `(x, x, x, 1)`。也就是说缺失的颜色通道补 0，缺失的 alpha 补 1（=255），单通道结果当作灰阶复制到 R/G/B。Gray8 输出只存一个通道，取补齐后像素的 red，所以 1–4 通道的表达式都能输出为 Gray8；BGRA/RGBA 接受 1–4 个通道。YUV 和 24 位格式不能作为 compose 输出；RGB 与 YUV 存储域之间的转换由输出 shader 负责。
+- `,` 是**组合运算符**（最低优先级），把两侧的通道按顺序拼成一个向量：`a.r, b.gb` 是 `float3(layers[0].r, layers[1].gb)`，共 3 个通道；组合结果超过 4 个通道直接报错。组合结果是一个值，可以继续参与运算或被成员使用，例如 `(a.lum, b.lum).avg`。
+- 表达式通道数不足 4 时按固定规则补成完整像素：3 通道 → `(x, y, z, 1)`，2 通道 → `(x, y, 0, 1)`，1 通道 → `(x, x, x, 1)`。也就是说缺失的颜色通道补 0，缺失的 alpha 补 1（=255），单通道结果当作灰阶复制到 R/G/B。Gray8 输出只存一个通道，取补齐后像素的 red，所以 1–4 通道的表达式都能输出为 Gray8；BGRA/RGBA 接受 1–4 个通道。YUV 和 24 位格式不能作为 compose 输出；RGB 与 YUV 存储域之间的转换由输出 shader 负责。
 - 常量为 float；表达式结果在 `[0,1]` 外不截断，输出 shader 的最后一步才 clamp。
-- swizzle 只能取操作数已有的通道，`a.rgb.a` 在编译期报错，而不是等到 HLSL 编译。
-- `layer.member` 是 `Shaders/Common.hlsl` 里的函数调用，见 7.2.1。
+- swizzle 是任意 `r`/`g`/`b`/`a` 组合（最多 4 个字符、允许重复），与参考工程 `Holly.Imaging.DX` 的 `^(r|g|b|a)+$` 一致，例如 `bgr`、`rr` 都合法；但只能取操作数已有的通道，`a.rgb.a` 在编译期报错，而不是等到 HLSL 编译。
+- 单独的 layer 名就是该 layer 的全部 4 个逻辑通道（参考工程的裸 source 名），`a*1.2-0.1` 因此合法。
+- `layer.member` 是 `Shaders/Common.hlsl` 里的函数调用或 HLSL intrinsic，见 7.2.1。
 - 通道只有位置语义，没有名字语义：`a.a, a.r, a.g, a.b` 就是把 a 通道放到 red、r 放到 green、g 放到 blue、b 放到 alpha（Bgra32 输出时内存顺序才是 B,G,R,A）。编译器不会做任何按名字推断的转换。
 
 示例：
@@ -458,9 +461,10 @@ a.r, b.g, b.b
 a.r - 0.2 * 3, (b.g - 0.5) * 2, (b.b - 0.5) * 2
 a.gb - b.gb
 a.lum, b.rgb
+a.lum, b.lum, (a.lum+b.lum)/2
 ```
 
-`a.gb - b.gb` 产生二维结果，补齐规则会把它当作 `(r, g, 0, 1)` 输出；如果蓝色不该是 0，就继续拆成两个逗号项，或与另一个标量通道组合。
+`a.gb - b.gb` 产生二维结果，本身就是一个值（可以继续与别的通道组合，或喂给成员），直接作为最终结果时补齐规则会把它当作 `(r, g, 0, 1)` 输出。
 
 ### 7.2.1 成员：`layer.member`
 
@@ -476,11 +480,29 @@ a.bin(b.r)            -> bin(layers[0], (float4)(layers[1].r))
 ```
 
 - 成员表在运行时从 `Common.hlsl` 的函数签名解析得到，因此新增或修改成员只需要改 shader 文件，C# 侧没有第二份需要同步的名单。签名参数无法用 float1..float4 表达（例如 `int`）时，该重载对表达式不可见。
+- 除 `Common.hlsl` 的函数外，HLSL intrinsic `abs`、`saturate`、`sqrt`、`sign`（输入输出同宽）和 `length`（任意宽度 → 1 通道）也是成员，名字和通道规则与参考工程 `IHLManager.RegisterIntrinsicFunctions` 一致。它们是编译内建，不会引入 `Common.hlsl`。
 - 重载按第一个参数（操作数）的宽度和参数个数选择。其余参数必须宽度完全匹配，或者是标量（生成 HLSL 时显式 splat 成 `floatN`，不依赖隐式标量提升）。
 - 成员结果的宽度决定它在表达式里贡献的通道数，例如 `a.lum` 是 1，`a.bin(0.5)` 是 4。返回值之后还可以继续 swizzle 或再套成员。
 - 找不到匹配重载、参数个数不符或引用了不存在的成员时，`CreateLayerCompose` 立即抛出带字符位置和可用重载列表的 `FormatException`。
-- 只有真正用到成员的表达式才会定义 `MEMBER_LIBRARY`，从而让 `Load.hlsl` 去 `#include "Common.hlsl"`；纯 swizzle 表达式编译时不带这份源码。
+- 只有真正用到 `Common.hlsl` 里函数的表达式才会定义 `MEMBER_LIBRARY`，从而让 `Load.hlsl` 去 `#include "Common.hlsl"`；纯 swizzle 或纯 intrinsic 表达式编译时不带这份源码。
 - 所有 layer 共享同一个 `Common.hlsl`，成员输入是逻辑通道（RGB 为 R/G/B/A，Gray8 为 v/v/v/1，YUV 为 Y/U/V/1），因此 `a.lum` 在 YUV 图像上按 (Y,U,V) 计算。
+
+#### 与参考工程 `Holly.Imaging.DX` 的兼容性
+
+参考工程的表达式语法是 `|` 组合通道、`.` 应用函数，例如 `top.lum|side.lum|(top.lum+side.lum)/2`。把 `|` 换成 `,` 之后，本引擎的语法完全覆盖它：
+
+| 参考工程 | 本引擎 |
+| --- | --- |
+| `top.rgb` | `a.rgb` |
+| `top.lum` | `a.lum` |
+| `1-top.lum` | `1-a.lum` |
+| `top.lum\|side.lum` | `a.lum, b.lum` |
+| `top.lum\|side.lum\|(top.lum+side.lum)/2` | `a.lum, b.lum, (a.lum+b.lum)/2` |
+| `(top.rgb).lum` | `(a.rgb).lum` |
+| `top.bgr` | `a.bgr` |
+| `top` / `side` | `a` / `b`（整个 layer，4 个逻辑通道） |
+
+函数集合同样对齐：参考工程 `IHLManager` 注册的 21 个 filter 加 5 个 intrinsic 在本引擎里都能用（`bin`/`bin2` 在本引擎里还额外支持传参）。`GrotheImages.Tests` 里有一组用例直接用参考工程的表达式（替换 `|`→`,`、`top`/`side`→layer 名）验证解析、通道数和 HLSL 输出。
 
 ### 7.3 着色器文件、宏注入和缓存
 

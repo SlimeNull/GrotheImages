@@ -51,6 +51,13 @@ internal static class ShaderLibrary
         @"^[ \t]*(float[234]?)[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\(([^)]*)\)[ \t]*$",
         RegexOptions.Multiline | RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    // HLSL intrinsics the reference engine registers as filters (RegisterIntrinsicFunctions). They are
+    // not declared in Common.hlsl, so they get their own table: same width in and out, except the ones
+    // that always reduce to a scalar.
+    private static readonly string[] Intrinsics = { "abs", "saturate", "sqrt", "sign" };
+
+    private static readonly string[] ScalarIntrinsics = { "length" };
+
     private static readonly Lazy<string> LazySource = new Lazy<string>(LoadSource);
 
     private static readonly Lazy<Dictionary<string, List<MemberOverload>>> LazyMembers =
@@ -60,8 +67,8 @@ internal static class ShaderLibrary
     public static string Source => LazySource.Value;
 
     /// <summary>
-    /// Every function declared in <c>Common.hlsl</c> becomes a layer member, so the shader file is the
-    /// single source of truth for the expression grammar.
+    /// Every function declared in <c>Common.hlsl</c> becomes a layer member, plus the HLSL intrinsics the
+    /// reference engine exposes. The shader file stays the single source of truth for the library itself.
     /// </summary>
     public static bool TryGetMember(string name, out List<MemberOverload> overloads)
     {
@@ -77,6 +84,14 @@ internal static class ShaderLibrary
     public static string DescribeOverloads(List<MemberOverload> overloads)
     {
         return string.Join(", ", overloads.Select(x => x.ToString()).ToArray());
+    }
+
+    /// <summary>
+    /// True for the HLSL intrinsics, which the generated shader can call without <c>Common.hlsl</c>.
+    /// </summary>
+    public static bool IsIntrinsic(string name)
+    {
+        return Intrinsics.Contains(name) || ScalarIntrinsics.Contains(name);
     }
 
     private static string LoadSource() => ShaderSource.Load("Common.hlsl");
@@ -122,7 +137,18 @@ internal static class ShaderLibrary
         }
         if (members.Count == 0)
             throw new GrotheImageException("The embedded shader library 'Common.hlsl' declares no usable member functions.");
+        foreach (string name in Intrinsics) AddIntrinsics(members, name, sameWidth: true);
+        foreach (string name in ScalarIntrinsics) AddIntrinsics(members, name, sameWidth: false);
         return members;
+    }
+
+    /// <summary>Registers one intrinsic for every operand width the expression language can produce.</summary>
+    private static void AddIntrinsics(Dictionary<string, List<MemberOverload>> members, string name, bool sameWidth)
+    {
+        var overloads = new List<MemberOverload>();
+        for (int width = 1; width <= 4; width++)
+            overloads.Add(new MemberOverload(new[] { width }, sameWidth ? width : 1));
+        members[name] = overloads;
     }
 
     private static int GetWidth(string type)

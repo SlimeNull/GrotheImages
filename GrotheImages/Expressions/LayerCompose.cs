@@ -12,12 +12,12 @@ public sealed class LayerCompose : IDisposable
     private LoadProgram _loadProgram;
     private GrotheImage _owner;
     private bool _disposed;
-    internal LayerCompose(string expression, IReadOnlyList<ExpressionNode> outputs, IReadOnlyCollection<int> referencedLayers, bool usesMemberExpression)
+    internal LayerCompose(string expression, ExpressionNode root, IReadOnlyCollection<int> referencedLayers, bool usesMemberExpression)
     {
         Expression = expression;
-        Outputs = new ReadOnlyCollection<ExpressionNode>(outputs.ToList());
+        Root = root;
         ReferencedLayerIndices = new ReadOnlyCollection<int>(referencedLayers.ToList());
-        OutputChannelCount = outputs.Sum(x => x.Width);
+        OutputChannelCount = root.Width;
         UsesMemberExpression = usesMemberExpression;
     }
 
@@ -27,7 +27,7 @@ public sealed class LayerCompose : IDisposable
     /// <summary>True when the expression calls into <c>Shaders/Common.hlsl</c>, which is then compiled into the shader.</summary>
     internal bool UsesMemberExpression { get; }
 
-    internal ReadOnlyCollection<ExpressionNode> Outputs { get; }
+    internal ExpressionNode Root { get; }
     internal ReadOnlyCollection<int> ReferencedLayerIndices { get; }
     internal GrotheImage Owner => _disposed ? null : _owner;
 
@@ -59,11 +59,7 @@ public sealed class LayerCompose : IDisposable
         }
     }
 
-    internal string ToHlsl()
-    {
-        var values = Outputs.Select(x => x.ToHlsl()).ToArray();
-        return string.Join(", ", values);
-    }
+    internal string ToHlsl() => Root.ToHlsl();
 }
 
 internal enum ExpressionTokenKind
@@ -264,6 +260,32 @@ internal sealed class MemberExpression : ExpressionNode
     }
 }
 
+/// <summary>
+/// The <c>,</c> operator: it concatenates the channels of its operands in order, exactly like the
+/// reference engine's <c>|</c> operator. Chains are flattened, so <c>a.r, b.g, b.b</c> becomes one
+/// <c>float3(...)</c> value.
+/// </summary>
+internal sealed class CompositionExpression : ExpressionNode
+{
+    public CompositionExpression(IReadOnlyList<ExpressionNode> operands, ExpressionType type) : base(type)
+    {
+        Operands = operands;
+    }
+
+    public IReadOnlyList<ExpressionNode> Operands { get; }
+
+    public override string ToHlsl()
+    {
+        var b = new StringBuilder("float").Append(Width).Append('(');
+        for (int i = 0; i < Operands.Count; i++)
+        {
+            if (i > 0) b.Append(", ");
+            b.Append(Operands[i].ToHlsl());
+        }
+        return b.Append(')').ToString();
+    }
+}
+
 internal sealed class UnaryExpression : ExpressionNode
 {
     public UnaryExpression(char operation, ExpressionNode operand) : base(operand.Type)
@@ -294,20 +316,12 @@ internal sealed class BinaryExpression : ExpressionNode
 
 internal static class ExpressionCompiler
 {
-    private static readonly HashSet<string> Swizzles = new HashSet<string>(StringComparer.Ordinal)
-    {
-        "r", "g", "b", "a", "rg", "gb", "rgb", "rgba"
-    };
-
     public static LayerCompose Compile(string expression, IReadOnlyList<string> layerNames)
     {
         if (string.IsNullOrWhiteSpace(expression)) throw new ArgumentException("Expression cannot be empty.", nameof(expression));
         var parser = new ExpressionParser(expression, layerNames);
-        var outputs = parser.Parse();
-        int channels = outputs.Sum(x => x.Width);
-        if (channels < 1 || channels > 4)
-            throw new FormatException("The expression must produce between one and four channels.");
-        return new LayerCompose(expression, outputs, parser.ReferencedLayers, parser.UsesMemberExpression);
+        ExpressionNode root = parser.Parse();
+        return new LayerCompose(expression, root, parser.ReferencedLayers, parser.UsesMemberExpression);
     }
 
     private sealed class ExpressionParser
@@ -330,15 +344,37 @@ internal static class ExpressionCompiler
 
         public bool UsesMemberExpression { get; private set; }
 
-        public List<ExpressionNode> Parse()
+        public ExpressionNode Parse()
         {
-            var result = new List<ExpressionNode> { ParseExpression() };
-            while (Accept(ExpressionTokenKind.Comma)) result.Add(ParseExpression());
+            ExpressionNode result = ParseExpression();
             Expect(ExpressionTokenKind.End);
             return result;
         }
 
-        private ExpressionNode ParseExpression() => ParseAdditive();
+        private ExpressionNode ParseExpression() => ParseComposition();
+
+        /// <summary>
+        /// The lowest precedence operator: <c>,</c> concatenates channels, just like the reference
+        /// engine's <c>|</c>. Member arguments parse at the additive level, so a comma inside a call
+        /// still separates arguments.
+        /// </summary>
+        private ExpressionNode ParseComposition()
+        {
+            ExpressionNode first = ParseAdditive();
+            if (_current.Kind != ExpressionTokenKind.Comma) return first;
+
+            var operands = new List<ExpressionNode> { first };
+            int width = first.Width;
+            while (Accept(ExpressionTokenKind.Comma))
+            {
+                ExpressionNode operand = ParseAdditive();
+                width += operand.Width;
+                if (width > 4)
+                    throw Error("A composition can hold at most four channels, but " + width + " were combined.", _current);
+                operands.Add(operand);
+            }
+            return new CompositionExpression(operands, new ExpressionType(width));
+        }
 
         private ExpressionNode ParseAdditive()
         {
@@ -381,7 +417,7 @@ internal static class ExpressionCompiler
             {
                 ExpressionNode expression = ParseExpression();
                 ExpressionToken closing = Expect(ExpressionTokenKind.RightParen);
-                return ParseAccessors(expression, closing, false);
+                return ParseAccessors(expression, closing);
             }
 
             if (_current.Kind == ExpressionTokenKind.Number)
@@ -410,30 +446,31 @@ internal static class ExpressionCompiler
                 throw Error("Unknown layer '" + layerToken.Text + "'.", layerToken);
             }
             ReferencedLayers.Add(layerIndex);
-            return ParseAccessors(new LayerExpression(layerIndex), layerToken, true);
+            // A bare layer reference is the whole layer, like the reference engine's bare source name.
+            return ParseAccessors(new LayerExpression(layerIndex), layerToken);
         }
 
         /// <summary>
         /// Reads the <c>.name</c> chain that follows a layer or a parenthesized term. Every step is either
         /// a channel swizzle or a member function of <c>Shaders/Common.hlsl</c>, optionally with arguments.
         /// </summary>
-        private ExpressionNode ParseAccessors(ExpressionNode operand, ExpressionToken ownerToken, bool requireAccessor)
+        private ExpressionNode ParseAccessors(ExpressionNode operand, ExpressionToken ownerToken)
         {
-            bool found = false;
             while (_current.Kind == ExpressionTokenKind.Dot)
             {
                 Advance();
                 ExpressionToken nameToken = Expect(ExpressionTokenKind.Identifier);
                 bool call = _current.Kind == ExpressionTokenKind.LeftParen;
                 List<MemberOverload> overloads;
-                if (!call && Swizzles.Contains(nameToken.Text))
+                if (!call && IsSwizzle(nameToken.Text))
                 {
                     operand = MakeSwizzle(operand, nameToken);
                 }
                 else if (ShaderLibrary.TryGetMember(nameToken.Text, out overloads))
                 {
                     operand = MakeMember(operand, nameToken, overloads, call ? ParseArguments() : new List<ExpressionNode>());
-                    UsesMemberExpression = true;
+                    // Intrinsics are HLSL builtins, so only a real library function needs Common.hlsl.
+                    if (!ShaderLibrary.IsIntrinsic(nameToken.Text)) UsesMemberExpression = true;
                 }
                 else if (call)
                 {
@@ -443,10 +480,7 @@ internal static class ExpressionCompiler
                 {
                     throw Error("Unknown member or channel swizzle '" + nameToken.Text + "'. Available members: " + string.Join(", ", ShaderLibrary.MemberNames.ToArray()) + ".", nameToken);
                 }
-                found = true;
             }
-            if (requireAccessor && !found)
-                throw Error("Expected '.', a channel swizzle or a member after layer '" + ownerToken.Text + "'.", _current);
             return operand;
         }
 
@@ -455,10 +489,23 @@ internal static class ExpressionCompiler
             Expect(ExpressionTokenKind.LeftParen);
             var arguments = new List<ExpressionNode>();
             if (Accept(ExpressionTokenKind.RightParen)) return arguments;
-            arguments.Add(ParseExpression());
-            while (Accept(ExpressionTokenKind.Comma)) arguments.Add(ParseExpression());
+            // Additive, not expression: a comma here separates arguments instead of composing channels.
+            arguments.Add(ParseAdditive());
+            while (Accept(ExpressionTokenKind.Comma)) arguments.Add(ParseAdditive());
             Expect(ExpressionTokenKind.RightParen);
             return arguments;
+        }
+
+        /// <summary>
+        /// Any combination of <c>r</c>, <c>g</c>, <c>b</c> and <c>a</c> up to four channels, matching the
+        /// swizzles the reference engine accepts (for example <c>bgr</c> or <c>rr</c>).
+        /// </summary>
+        private static bool IsSwizzle(string name)
+        {
+            if (name.Length == 0 || name.Length > 4) return false;
+            for (int i = 0; i < name.Length; i++)
+                if ("rgba".IndexOf(name[i]) < 0) return false;
+            return true;
         }
 
         private ExpressionNode MakeSwizzle(ExpressionNode operand, ExpressionToken token)
