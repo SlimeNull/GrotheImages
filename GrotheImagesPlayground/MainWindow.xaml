@@ -45,10 +45,11 @@
             </TabItem>
             <TabItem Header="UpdateTile">
                 <ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Margin="8">
-                    <TextBlock Text="Tile file (decoded as BGRA32)"/><DockPanel><TextBox x:Name="TileFile"/><Button Content="Browse" DockPanel.Dock="Right" Width="90" Click="BrowseTileClick"/></DockPanel>
+                    <TextBlock Text="Tile image file (format detected automatically)"/><DockPanel><TextBox x:Name="TileFile"/><Button Content="Browse" DockPanel.Dock="Right" Width="90" Click="BrowseTileClick"/></DockPanel>
                     <WrapPanel Margin="0,6"><TextBlock Text="Layer"/><TextBox x:Name="TileLayer" Width="55" Text="0" Margin="4,0,12,0"/><TextBlock Text="Row"/><TextBox x:Name="TileRow" Width="60" Text="0" Margin="4,0,12,0"/><TextBlock Text="Column"/><TextBox x:Name="TileColumn" Width="60" Text="0" Margin="4,0,12,0"/><TextBlock Text="Storage"/><TextBlock x:Name="TileStorageInfo" Text="Create or open an image first." Margin="4,0,0,0"/></WrapPanel>
                     <TextBlock x:Name="TileFileInfo" Text="Choose an image file. Tile size, stride and format are automatic." Margin="0,6,0,2"/>
-                    <TextBlock Text="For Yuv422/Yuv420, select the raw Y and UV plane files below. Their dimensions and strides come from the image format and tile layout." Margin="0,6,0,2" TextWrapping="Wrap"/>
+                    <TextBlock Text="For planar YUV input, select the raw Y and UV files below. The input plane format is required because raw files have no metadata; conversion to the current GrotheImage format is performed on the GPU." Margin="0,6,0,2" TextWrapping="Wrap"/>
+                    <WrapPanel Margin="0,4"><TextBlock Text="Plane input format" VerticalAlignment="Center"/><ComboBox x:Name="TilePlaneFormat" Width="120" Margin="6,0,0,0"/></WrapPanel>
                     <TextBlock Text="Y plane file"/><DockPanel><TextBox x:Name="YPlaneFile"/><Button Content="Browse" DockPanel.Dock="Right" Width="90" Click="BrowseYPlaneClick"/></DockPanel>
                     <TextBlock Text="UV plane file"/><DockPanel><TextBox x:Name="UvPlaneFile"/><Button Content="Browse" DockPanel.Dock="Right" Width="90" Click="BrowseUvPlaneClick"/></DockPanel>
                     <TextBlock x:Name="YuvPlaneInfo" Margin="0,4,0,0"/>
@@ -60,9 +61,9 @@
                     <WrapPanel><TextBlock Text="Mode" VerticalAlignment="Center"/><ComboBox x:Name="LoadMode" Width="150" Margin="5,0,15,0"><ComboBoxItem Content="Layer" IsSelected="True"/><ComboBoxItem Content="Compose"/></ComboBox><TextBlock Text="Layer" VerticalAlignment="Center"/><TextBox x:Name="LoadLayer" Width="55" Text="0" Margin="5,0,15,0"/><TextBlock Text="Format" VerticalAlignment="Center"/><ComboBox x:Name="LoadFormat" Width="120"/></WrapPanel>
                     <TextBlock Text="Compose expression (for Compose mode)" Margin="0,8,0,2"/><TextBox x:Name="ComposeExpression" Text="a.r, a.g, a.b, 1"/>
                     <WrapPanel Margin="0,8"><TextBlock Text="Output width"/><TextBox x:Name="LoadWidth" Width="70" Text="1024" Margin="5,0,15,0"/><TextBlock Text="Height"/><TextBox x:Name="LoadHeight" Width="70" Text="768" Margin="5,0,15,0"/><TextBlock Text="Stride"/><TextBox x:Name="LoadStride" Width="90" Text="0"/></WrapPanel>
-                    <TextBlock Text="Drag the target quadrilateral. Its coordinate system is the output image." Margin="0,8,0,4"/>
+                    <TextBlock Text="The current GrotheImage is shown below. Drag the four points to select a source quadrilateral." Margin="0,8,0,4" TextWrapping="Wrap"/>
                     <local:PerspectiveEditor x:Name="LoadPerspective" HorizontalAlignment="Left"/>
-                    <TextBlock Text="Export file" Margin="0,8,0,2"/><DockPanel><TextBox x:Name="ExportFile"/><Button Content="Browse" DockPanel.Dock="Right" Width="90" Click="BrowseExportClick"/></DockPanel>
+                    <TextBlock Text="Export file (.png or .jpg)" Margin="0,8,0,2"/><DockPanel><TextBox x:Name="ExportFile"/><Button Content="Browse" DockPanel.Dock="Right" Width="90" Click="BrowseExportClick"/></DockPanel>
                     <Button Content="Load and export" Width="140" HorizontalAlignment="Left" Margin="0,8" Click="LoadExportClick"/>
                 </StackPanel></ScrollViewer>
             </TabItem>

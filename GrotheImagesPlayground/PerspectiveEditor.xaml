@@ -4,6 +4,7 @@
              MinWidth="360" MinHeight="250">
     <Border BorderBrush="Gray" BorderThickness="1" Background="White">
         <Canvas x:Name="Surface" Width="420" Height="260" ClipToBounds="True">
+            <Image x:Name="BackgroundImage" IsHitTestVisible="False" Stretch="Fill" />
             <Polygon x:Name="Polygon" Stroke="DarkBlue" StrokeThickness="1" Fill="#22000080" />
             <Line x:Name="TopLine" Stroke="DarkBlue" StrokeThickness="1" />
             <Line x:Name="RightLine" Stroke="DarkBlue" StrokeThickness="1" />

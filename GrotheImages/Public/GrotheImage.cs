@@ -122,12 +122,16 @@ public sealed class GrotheImage : IDisposable
             ValidateLayerIndex(layerIndex);
             if (format != PixelFormat.Yuv422 && format != PixelFormat.Yuv420)
                 throw new ArgumentException("The two-plane UpdateTile overload is only valid for Yuv422 or Yuv420.", nameof(format));
-            if (format != Format) throw new ArgumentException("UpdateTile format must match GrotheImage.Format.", nameof(format));
+            if (format == PixelFormat.Yuv422 && (Info.TileWidth & 1) != 0)
+                throw new ArgumentException("Yuv422 input requires an even tile width.", nameof(format));
+            if (format == PixelFormat.Yuv420 && ((Info.TileWidth & 1) != 0 || (Info.TileHeight & 1) != 0))
+                throw new ArgumentException("Yuv420 input requires even tile dimensions.", nameof(format));
             if (yScan0 == 0 || uvScan0 == 0) throw new ArgumentNullException(nameof(yScan0));
-            if (yStride <= 0 || uvStride <= 0) throw new ArgumentOutOfRangeException(nameof(yStride));
+            if (yStride < Info.TileWidth) throw new ArgumentOutOfRangeException(nameof(yStride));
+            if (uvStride < checked((Info.TileWidth / 2) * 2)) throw new ArgumentOutOfRangeException(nameof(uvStride));
             TileGrid.GetLinearIndex(Info, tileRow, tileColumn);
             EnsureGraphics();
-            GpuImageProcessor.UpdateTile(this, layerIndex, tileRow, tileColumn, yScan0, Info.TileWidth, Info.TileHeight, yStride, format, uvScan0, UvTileWidth, uvStride, format);
+            GpuImageProcessor.UpdateTile(this, layerIndex, tileRow, tileColumn, yScan0, Info.TileWidth, Info.TileHeight, yStride, format, uvScan0, Info.TileWidth / 2, uvStride, format);
         }
     }
 
@@ -152,8 +156,6 @@ public sealed class GrotheImage : IDisposable
         }
     }
 
-    private int UvTileWidth => Format == PixelFormat.Yuv422 || Format == PixelFormat.Yuv420 ? Info.TileWidth / 2 : Info.TileWidth;
-
     private void EnsureGraphics()
     {
         if (_graphics != null) return;
@@ -177,7 +179,6 @@ public sealed class GrotheImage : IDisposable
     {
         TileGrid.GetLinearIndex(Info, tileRow, tileColumn);
         if (scan0 == 0) throw new ArgumentNullException(nameof(scan0));
-        if (format != Format) throw new ArgumentException("UpdateTile format must match GrotheImage.Format.", nameof(format));
         if (width != Info.TileWidth || height != Info.TileHeight) throw new ArgumentException("Every tile has the same full storage dimensions.");
         if (format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420) throw new ArgumentException("Use the Y/UV UpdateTile overload for subsampled YUV.", nameof(format));
         if (stride <= 0 || stride < checked(width * PixelFormatRules.BytesPerPixel(format))) throw new ArgumentOutOfRangeException(nameof(stride));

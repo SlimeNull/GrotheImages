@@ -222,6 +222,97 @@ public sealed class GpuIntegrationTests
     }
 
     [Fact]
+    public void PackedTileFormatConversionUsesGpuForYuv420Storage()
+    {
+        const int width = 4;
+        const int height = 2;
+        byte[] source = new byte[width * height * 4];
+        for (int i = 0; i < source.Length; i += 4)
+        {
+            source[i] = 130;
+            source[i + 1] = 120;
+            source[i + 2] = 110;
+            source[i + 3] = 255;
+        }
+        byte[] output = new byte[source.Length];
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            using var image = CreateGpuImage(PixelFormat.Yuv420, width, height);
+            image.UpdateTile(0, 0, 0, sourcePtr, width, height, width * 4, PixelFormat.Bgra32);
+            image.Load(0, outputPtr, width, height, width * 4, PixelFormat.Bgra32, TransformMatrix.Identity);
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+            Assert.InRange(output[0], (byte)95, (byte)150);
+            Assert.InRange(output[1], (byte)95, (byte)150);
+            Assert.InRange(output[2], (byte)95, (byte)150);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void PlanarTileFormatConversionUsesGpuForPackedStorage()
+    {
+        const int width = 4;
+        const int height = 2;
+        byte[] y = { 90, 90, 90, 90, 90, 90, 90, 90 };
+        byte[] uv = { 128, 128, 128, 128 };
+        byte[] output = new byte[width * height * 4];
+        IntPtr yPtr = Marshal.AllocHGlobal(y.Length);
+        IntPtr uvPtr = Marshal.AllocHGlobal(uv.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
+        try
+        {
+            Marshal.Copy(y, 0, yPtr, y.Length);
+            Marshal.Copy(uv, 0, uvPtr, uv.Length);
+            using var image = CreateGpuImage(PixelFormat.Bgra32, width, height);
+            image.UpdateTile(0, 0, 0, yPtr, width, uvPtr, width, PixelFormat.Yuv420);
+            image.Load(0, outputPtr, width, height, width * 4, PixelFormat.Bgra32, TransformMatrix.Identity);
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+            Assert.InRange(output[0], (byte)75, (byte)105);
+            Assert.InRange(output[1], (byte)75, (byte)105);
+            Assert.InRange(output[2], (byte)75, (byte)105);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(yPtr);
+            Marshal.FreeHGlobal(uvPtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
+    public void Packed24TileFormatConversionUsesGpuForRgbaStorage()
+    {
+        byte[] source = { 10, 20, 30, 40, 50, 60 };
+        byte[] output = new byte[8];
+        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
+        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
+        try
+        {
+            Marshal.Copy(source, 0, sourcePtr, source.Length);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, 2, 1);
+            image.UpdateTile(0, 0, 0, sourcePtr, 2, 1, 6, PixelFormat.Bgr24);
+            image.Load(0, outputPtr, 2, 1, 8, PixelFormat.Rgba32, TransformMatrix.Identity);
+            Marshal.Copy(outputPtr, output, 0, output.Length);
+            Assert.Equal(30, output[0]);
+            Assert.Equal(20, output[1]);
+            Assert.Equal(10, output[2]);
+            Assert.Equal(255, output[3]);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(sourcePtr);
+            Marshal.FreeHGlobal(outputPtr);
+        }
+    }
+
+    [Fact]
     public void OverlapSamplingUsesTheRightHalfBoundaryRule()
     {
         const int tileWidth = 100;
