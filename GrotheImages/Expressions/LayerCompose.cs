@@ -12,16 +12,20 @@ public sealed class LayerCompose : IDisposable
     private LoadProgram _loadProgram;
     private GrotheImage _owner;
     private bool _disposed;
-    internal LayerCompose(string expression, IReadOnlyList<ExpressionNode> outputs, IReadOnlyCollection<int> referencedLayers)
+    internal LayerCompose(string expression, IReadOnlyList<ExpressionNode> outputs, IReadOnlyCollection<int> referencedLayers, bool usesMemberExpression)
     {
         Expression = expression;
         Outputs = new ReadOnlyCollection<ExpressionNode>(outputs.ToList());
         ReferencedLayerIndices = new ReadOnlyCollection<int>(referencedLayers.ToList());
         OutputChannelCount = outputs.Sum(x => x.Width);
+        UsesMemberExpression = usesMemberExpression;
     }
 
     public string Expression { get; }
     public int OutputChannelCount { get; }
+
+    /// <summary>True when the expression calls into <c>Shaders/Common.hlsl</c>, which is then compiled into the shader.</summary>
+    internal bool UsesMemberExpression { get; }
 
     internal ReadOnlyCollection<ExpressionNode> Outputs { get; }
     internal ReadOnlyCollection<int> ReferencedLayerIndices { get; }
@@ -191,17 +195,71 @@ internal sealed class ConstantExpression : ExpressionNode
     public override string ToHlsl() => Value.ToString("R", CultureInfo.InvariantCulture);
 }
 
-internal sealed class ChannelExpression : ExpressionNode
+internal sealed class LayerExpression : ExpressionNode
 {
-    public ChannelExpression(int layerIndex, string swizzle) : base(new ExpressionType(swizzle.Length))
+    public LayerExpression(int layerIndex) : base(new ExpressionType(4))
     {
         LayerIndex = layerIndex;
-        Swizzle = swizzle;
     }
 
     public int LayerIndex { get; }
+    public override string ToHlsl() => "Layer" + LayerIndex;
+}
+
+internal sealed class SwizzleExpression : ExpressionNode
+{
+    public SwizzleExpression(ExpressionNode operand, string swizzle) : base(new ExpressionType(swizzle.Length))
+    {
+        Operand = operand;
+        Swizzle = swizzle;
+    }
+
+    public ExpressionNode Operand { get; }
     public string Swizzle { get; }
-    public override string ToHlsl() => "Layer" + LayerIndex + "." + Swizzle;
+
+    public override string ToHlsl()
+    {
+        // A layer read is a plain variable and can be swizzled directly; every other operand needs
+        // parentheses so the swizzle binds to the whole expression.
+        string source = Operand is LayerExpression ? Operand.ToHlsl() : "(" + Operand.ToHlsl() + ")";
+        return source + "." + Swizzle;
+    }
+}
+
+/// <summary>A call into <c>Shaders/Common.hlsl</c>: <c>a.lum</c> compiles to <c>lum(Layer0)</c>.</summary>
+internal sealed class MemberExpression : ExpressionNode
+{
+    private readonly int[] _parameterWidths;
+
+    public MemberExpression(string name, ExpressionNode operand, IReadOnlyList<ExpressionNode> arguments, MemberOverload overload)
+        : base(new ExpressionType(overload.ResultWidth))
+    {
+        Name = name;
+        Operand = operand;
+        Arguments = arguments;
+        _parameterWidths = overload.ParameterWidths;
+    }
+
+    public string Name { get; }
+    public ExpressionNode Operand { get; }
+    public IReadOnlyList<ExpressionNode> Arguments { get; }
+
+    public override string ToHlsl()
+    {
+        var b = new StringBuilder(Name).Append('(').Append(Operand.ToHlsl());
+        for (int i = 0; i < Arguments.Count; i++)
+        {
+            b.Append(", ");
+            int width = _parameterWidths[i + 1];
+            // A scalar argument of a vector parameter is splatted explicitly, so the HLSL overload is
+            // chosen without relying on implicit scalar promotion.
+            if (width > 1 && Arguments[i].Width == 1)
+                b.Append("(float").Append(width).Append(")(").Append(Arguments[i].ToHlsl()).Append(')');
+            else
+                b.Append(Arguments[i].ToHlsl());
+        }
+        return b.Append(')').ToString();
+    }
 }
 
 internal sealed class UnaryExpression : ExpressionNode
@@ -247,7 +305,7 @@ internal static class ExpressionCompiler
         int channels = outputs.Sum(x => x.Width);
         if (channels < 1 || channels > 4)
             throw new FormatException("The expression must produce between one and four channels.");
-        return new LayerCompose(expression, outputs, parser.ReferencedLayers);
+        return new LayerCompose(expression, outputs, parser.ReferencedLayers, parser.UsesMemberExpression);
     }
 
     private sealed class ExpressionParser
@@ -267,6 +325,8 @@ internal static class ExpressionCompiler
         }
 
         public HashSet<int> ReferencedLayers { get; }
+
+        public bool UsesMemberExpression { get; private set; }
 
         public List<ExpressionNode> Parse()
         {
@@ -318,8 +378,8 @@ internal static class ExpressionCompiler
             if (Accept(ExpressionTokenKind.LeftParen))
             {
                 ExpressionNode expression = ParseExpression();
-                Expect(ExpressionTokenKind.RightParen);
-                return expression;
+                ExpressionToken closing = Expect(ExpressionTokenKind.RightParen);
+                return ParseAccessors(expression, closing, false);
             }
 
             if (_current.Kind == ExpressionTokenKind.Number)
@@ -332,16 +392,118 @@ internal static class ExpressionCompiler
                 return new ConstantExpression(value);
             }
 
+            return ParseReference();
+        }
+
+        private ExpressionNode ParseReference()
+        {
             ExpressionToken layerToken = Expect(ExpressionTokenKind.Identifier);
-            Expect(ExpressionTokenKind.Dot);
-            ExpressionToken swizzleToken = Expect(ExpressionTokenKind.Identifier);
-            if (!Swizzles.Contains(swizzleToken.Text)) throw Error("Unsupported channel swizzle.", swizzleToken);
             int layerIndex = -1;
             for (int i = 0; i < _layerNames.Count; i++)
                 if (string.Equals(_layerNames[i], layerToken.Text, StringComparison.Ordinal)) { layerIndex = i; break; }
-            if (layerIndex < 0) throw Error("Unknown layer '" + layerToken.Text + "'.", layerToken);
+            if (layerIndex < 0)
+            {
+                if (ShaderLibrary.TryGetMember(layerToken.Text, out _))
+                    throw Error("'" + layerToken.Text + "' is a shader member and must be applied to a layer, for example 'a." + layerToken.Text + "'.", layerToken);
+                throw Error("Unknown layer '" + layerToken.Text + "'.", layerToken);
+            }
             ReferencedLayers.Add(layerIndex);
-            return new ChannelExpression(layerIndex, swizzleToken.Text);
+            return ParseAccessors(new LayerExpression(layerIndex), layerToken, true);
+        }
+
+        /// <summary>
+        /// Reads the <c>.name</c> chain that follows a layer or a parenthesized term. Every step is either
+        /// a channel swizzle or a member function of <c>Shaders/Common.hlsl</c>, optionally with arguments.
+        /// </summary>
+        private ExpressionNode ParseAccessors(ExpressionNode operand, ExpressionToken ownerToken, bool requireAccessor)
+        {
+            bool found = false;
+            while (_current.Kind == ExpressionTokenKind.Dot)
+            {
+                Advance();
+                ExpressionToken nameToken = Expect(ExpressionTokenKind.Identifier);
+                bool call = _current.Kind == ExpressionTokenKind.LeftParen;
+                List<MemberOverload> overloads;
+                if (!call && Swizzles.Contains(nameToken.Text))
+                {
+                    operand = MakeSwizzle(operand, nameToken);
+                }
+                else if (ShaderLibrary.TryGetMember(nameToken.Text, out overloads))
+                {
+                    operand = MakeMember(operand, nameToken, overloads, call ? ParseArguments() : new List<ExpressionNode>());
+                    UsesMemberExpression = true;
+                }
+                else if (call)
+                {
+                    throw Error("Unknown member '" + nameToken.Text + "'. Available members: " + string.Join(", ", ShaderLibrary.MemberNames.ToArray()) + ".", nameToken);
+                }
+                else
+                {
+                    throw Error("Unknown member or channel swizzle '" + nameToken.Text + "'. Available members: " + string.Join(", ", ShaderLibrary.MemberNames.ToArray()) + ".", nameToken);
+                }
+                found = true;
+            }
+            if (requireAccessor && !found)
+                throw Error("Expected '.', a channel swizzle or a member after layer '" + ownerToken.Text + "'.", _current);
+            return operand;
+        }
+
+        private List<ExpressionNode> ParseArguments()
+        {
+            Expect(ExpressionTokenKind.LeftParen);
+            var arguments = new List<ExpressionNode>();
+            if (Accept(ExpressionTokenKind.RightParen)) return arguments;
+            arguments.Add(ParseExpression());
+            while (Accept(ExpressionTokenKind.Comma)) arguments.Add(ParseExpression());
+            Expect(ExpressionTokenKind.RightParen);
+            return arguments;
+        }
+
+        private ExpressionNode MakeSwizzle(ExpressionNode operand, ExpressionToken token)
+        {
+            for (int i = 0; i < token.Text.Length; i++)
+            {
+                if ("rgba".IndexOf(token.Text[i]) >= operand.Width)
+                    throw Error("Channel '" + token.Text[i] + "' is not part of a " + operand.Width + " channel value.", token);
+            }
+            return new SwizzleExpression(operand, token.Text);
+        }
+
+        private ExpressionNode MakeMember(ExpressionNode operand, ExpressionToken token, List<MemberOverload> overloads, List<ExpressionNode> arguments)
+        {
+            MemberOverload? selected = null;
+            bool selectedExactly = false;
+            foreach (MemberOverload overload in overloads)
+            {
+                if (overload.ArgumentCount != arguments.Count) continue;
+                if (overload.OperandWidth != operand.Width) continue;
+                bool exactly = true;
+                bool compatible = true;
+                for (int i = 0; i < arguments.Count; i++)
+                {
+                    int parameterWidth = overload.ParameterWidths[i + 1];
+                    if (arguments[i].Width == parameterWidth) continue;
+                    if (arguments[i].Width == 1) { exactly = false; continue; }
+                    compatible = false;
+                    break;
+                }
+                if (!compatible) continue;
+                if (selected == null || (exactly && !selectedExactly))
+                {
+                    selected = overload;
+                    selectedExactly = exactly;
+                }
+            }
+
+            if (selected == null)
+            {
+                int[] widths = overloads.Where(x => x.ArgumentCount == arguments.Count).Select(x => x.OperandWidth).Distinct().OrderBy(x => x).ToArray();
+                string reason = widths.Length == 0
+                    ? "does not take " + arguments.Count + " argument" + (arguments.Count == 1 ? string.Empty : "s")
+                    : "does not accept a " + operand.Width + " channel operand";
+                throw Error("Member '" + token.Text + "' " + reason + ". Overloads: " + ShaderLibrary.DescribeOverloads(overloads) + ".", token);
+            }
+            return new MemberExpression(token.Text, operand, arguments, selected.Value);
         }
 
         private static ExpressionNode MakeBinary(char operation, ExpressionNode left, ExpressionNode right)

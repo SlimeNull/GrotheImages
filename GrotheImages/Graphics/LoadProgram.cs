@@ -182,6 +182,13 @@ internal sealed class LoadProgram : IDisposable
         bool yuv = image.Format == PixelFormat.Yuv444 || image.Format == PixelFormat.Yuv422 || image.Format == PixelFormat.Yuv420;
         bool gray = image.Format == PixelFormat.Gray8;
         var b = new StringBuilder();
+        // The helper library must precede every call into it. Only compose programs that use a member
+        // pay for the extra source.
+        if (compose != null && compose.UsesMemberExpression)
+        {
+            b.AppendLine(ShaderLibrary.Source);
+            b.AppendLine();
+        }
         for (int i = 0; i < layerCount; i++)
         {
             if (yuv)

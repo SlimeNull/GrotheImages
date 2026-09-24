@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net462</TargetFramework>
@@ -10,6 +10,10 @@
     <PlatformTarget>x64</PlatformTarget>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Shaders\Common.hlsl" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Vortice.Direct3D11" Version="2.3.0" />

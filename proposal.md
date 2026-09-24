@@ -431,8 +431,11 @@ expression    := additive
 additive      := multiplicative (('+' | '-') multiplicative)*
 multiplicative:= unary (('*' | '/') unary)*
 unary         := ('+' | '-') unary | primary
-primary       := number | layerChannel | '(' expression ')'
-layerChannel  := identifier '.' swizzle
+primary       := number | '(' expression ')' | reference
+reference     := identifier accessor+
+accessor      := '.' swizzle | '.' member arguments?
+member        := identifier
+arguments     := '(' expression (',' expression)* ')'
 swizzle       := 'r' | 'g' | 'b' | 'a' | 'rg' | 'gb' | 'rgb' | 'rgba'
 ```
 
@@ -444,6 +447,8 @@ swizzle       := 'r' | 'g' | 'b' | 'a' | 'rg' | 'gb' | 'rgb' | 'rgba'
 - 乘法和除法是逐分量运算，不支持矩阵乘法或 dot product。
 - 逗号分隔的结果会把每个标量/向量结果按顺序展开，因此 `a.r, b.gb` 是 3 个输出通道。总通道数量必须能映射到目标 `PixelFormat`：Gray8 为 1，BGRA/RGBA 为 4。YUV 和 24 位格式不能作为 compose 输出；RGB 与 YUV 存储域之间的转换由输出 shader 负责。
 - 常量为 float；表达式结果在 `[0,1]` 外不截断，输出 shader 的最后一步才 clamp。
+- swizzle 只能取操作数已有的通道，`a.rgb.a` 在编译期报错，而不是等到 HLSL 编译。
+- `layer.member` 是 `Shaders/Common.hlsl` 里的函数调用，见 7.2.1。
 
 示例：
 
@@ -451,9 +456,30 @@ swizzle       := 'r' | 'g' | 'b' | 'a' | 'rg' | 'gb' | 'rgb' | 'rgba'
 a.r, b.g, b.b
 a.r - 0.2 * 3, (b.g - 0.5) * 2, (b.b - 0.5) * 2
 a.gb - b.gb
+a.lum, b.rgb
 ```
 
 `a.gb - b.gb` 产生二维结果，不能单独作为 RGB 输出的三个通道；可以继续拆成两个逗号项，或与另一个标量通道组合。
+
+### 7.2.1 成员：`layer.member`
+
+`Shaders/Common.hlsl` 中声明的每个函数都是 layer 的“成员”。`layer.member` 把该 layer 解码出的 `float4` 作为函数的第一个参数，`layer.member(args...)` 的其它参数按顺序跟在后面：
+
+```text
+a.lum                 -> lum(Layer0)                              1 通道
+a.rgb.lum             -> lum(Layer0.rgb)                          1 通道
+a.hsv.rgb             -> (hsv(Layer0)).rgb                        3 通道
+a.bin(0.5)            -> bin(Layer0, (float4)(0.5))               4 通道
+a.bin2(0.1, 0.4)      -> bin2(Layer0, (float4)(0.1), (float4)(0.4))
+a.bin(b.r)            -> bin(Layer0, (float4)(Layer1.r))
+```
+
+- 成员表在运行时从 `Common.hlsl` 的函数签名解析得到，因此新增或修改成员只需要改 shader 文件，C# 侧没有第二份需要同步的名单。签名参数无法用 float1..float4 表达（例如 `int`）时，该重载对表达式不可见。
+- 重载按第一个参数（操作数）的宽度和参数个数选择。其余参数必须宽度完全匹配，或者是标量（生成 HLSL 时显式 splat 成 `floatN`，不依赖隐式标量提升）。
+- 成员结果的宽度决定它在表达式里贡献的通道数，例如 `a.lum` 是 1，`a.bin(0.5)` 是 4。返回值之后还可以继续 swizzle 或再套成员。
+- 找不到匹配重载、参数个数不符或引用了不存在的成员时，`CreateLayerCompose` 立即抛出带字符位置和可用重载列表的 `FormatException`。
+- 只有真正用到成员的表达式才会把 `Common.hlsl` 拼进生成的 shader；纯 swizzle 表达式保持原有的源码。
+- 所有 layer 共享同一个 `Common.hlsl`，成员输入是逻辑通道（RGB 为 R/G/B/A，Gray8 为 v/v/v/1，YUV 为 Y/U/V/1），因此 `a.lum` 在 YUV 图像上按 (Y,U,V) 计算。
 
 ### 7.3 HLSL 生成和缓存
 

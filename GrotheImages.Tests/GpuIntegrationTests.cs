@@ -370,6 +370,44 @@ public sealed class GpuIntegrationTests
     }
 
     [Fact]
+    public void ComposeMemberExpressionRunsInThePixelShader()
+    {
+        IntPtr outputPtr = Marshal.AllocHGlobal(4);
+        IntPtr aPtr = Marshal.AllocHGlobal(4);
+        try
+        {
+            Marshal.Copy(new byte[] { 50, 100, 150, 255 }, 0, aPtr, 4);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, 1, 1);
+            image.UpdateTile(0, 0, 0, aPtr, 1, 1, 4, PixelFormat.Rgba32);
+
+            using (var compose = image.CreateLayerCompose("a.lum"))
+            {
+                image.Load(compose, outputPtr, 1, 1, 1, PixelFormat.Gray8, TransformMatrix.Identity);
+                byte[] gray = new byte[1];
+                Marshal.Copy(outputPtr, gray, 0, 1);
+                // 50 * 0.299 + 100 * 0.587 + 150 * 0.114 = 90.75
+                Assert.InRange(gray[0], (byte)89, (byte)92);
+            }
+
+            // The scalar threshold is splatted to float4 in the generated HLSL.
+            Marshal.Copy(new byte[] { 0, 100, 200, 255 }, 0, aPtr, 4);
+            image.UpdateTile(0, 0, 0, aPtr, 1, 1, 4, PixelFormat.Rgba32);
+            using (var compose = image.CreateLayerCompose("a.bin(0.5)"))
+            {
+                image.Load(compose, outputPtr, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+                byte[] binarized = new byte[4];
+                Marshal.Copy(outputPtr, binarized, 0, 4);
+                Assert.Equal(new byte[] { 0, 0, 255, 255 }, binarized);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(outputPtr);
+            Marshal.FreeHGlobal(aPtr);
+        }
+    }
+
+    [Fact]
     public void TextureArrayPagesAreSelectedByLoadShader()
     {
         const int columns = 2050;
