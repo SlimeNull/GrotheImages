@@ -6,8 +6,6 @@ public enum PixelFormat
 {
     Bgra32,
     Rgba32,
-    Bgr24,
-    Rgb24,
     Gray8,
     Yuv444,
     Yuv422,

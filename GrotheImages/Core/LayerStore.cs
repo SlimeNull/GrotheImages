@@ -73,8 +73,6 @@ internal sealed class TileArrayPage : IDisposable
                 Color = new TileArrayResource(graphics, DxgiFormat.B8G8R8A8_UNorm, info.TileWidth, info.TileHeight, arraySize, false);
                 break;
             case PixelFormat.Rgba32:
-            case PixelFormat.Bgr24:
-            case PixelFormat.Rgb24:
                 Color = new TileArrayResource(graphics, DxgiFormat.R8G8B8A8_UNorm, info.TileWidth, info.TileHeight, arraySize, false);
                 break;
             case PixelFormat.Yuv444:

@@ -24,8 +24,6 @@ public sealed class ArgumentValidationTests
     }
 
     [Theory]
-    [InlineData(PixelFormat.Bgr24)]
-    [InlineData(PixelFormat.Rgb24)]
     [InlineData(PixelFormat.Yuv444)]
     [InlineData(PixelFormat.Yuv422)]
     [InlineData(PixelFormat.Yuv420)]
