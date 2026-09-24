@@ -17,6 +17,11 @@ internal static class GpuImageProcessor
             .Execute(layerIndex, scan0, width, height, stride, format, inverse);
     }
 
+    public static void BlendSeams(GrotheImage image)
+    {
+        image.GetBlendProgram().Execute();
+    }
+
     public static void UpdateTile(GrotheImage image, int layerIndex, long tileRow, long tileColumn, nint scan0, int width, int height, int stride, PixelFormat format)
     {
         if (format == image.Format && (format == PixelFormat.Bgra32 || format == PixelFormat.Rgba32 || format == PixelFormat.Gray8))

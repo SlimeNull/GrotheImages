@@ -14,6 +14,7 @@ public sealed class GrotheImage : IDisposable
     private LoadProgram _loadProgram;
     private UpdateProgram _updateProgram;
     private readonly HashSet<LayerCompose> _composes = new HashSet<LayerCompose>();
+    private BlendProgram _blendProgram;
     private bool _disposed;
 
     public GrotheImage(GrotheImageInfo info, PixelFormat format, params string[] layerNames)
@@ -97,6 +98,23 @@ public sealed class GrotheImage : IDisposable
         }
     }
 
+    /// <summary>
+    /// Cross fades the overlapping border of every pair of neighbouring tiles, in every layer, so the joins
+    /// between tiles disappear. Tiles are photographed separately and never match exactly, so calling this
+    /// once after every tile has been written replaces the hard switch in the overlap with a smooth ramp.
+    /// Tiles that were never written are left alone, and blending a second time changes nothing.
+    /// </summary>
+    public void BlendSeams()
+    {
+        lock (_sync)
+        {
+            ThrowIfDisposed();
+            if (Info.TileOverlapX == 0 && Info.TileOverlapY == 0) return;
+            EnsureGraphics();
+            GpuImageProcessor.BlendSeams(this);
+        }
+    }
+
     public void Load(LayerCompose layerCompose, nint scan0, int width, int height, int stride, PixelFormat format, TransformMatrix transformMatrix)
     {
         if (layerCompose == null) throw new ArgumentNullException(nameof(layerCompose));
@@ -129,6 +147,7 @@ public sealed class GrotheImage : IDisposable
     internal object SyncRoot => _sync;
     internal LoadProgram GetLoadProgram() => _loadProgram ?? (_loadProgram = new LoadProgram(this, null));
     internal UpdateProgram GetUpdateProgram() => _updateProgram ?? (_updateProgram = new UpdateProgram());
+    internal BlendProgram GetBlendProgram() => _blendProgram ?? (_blendProgram = new BlendProgram(this));
     internal void ReleaseCompose(LayerCompose compose) => _composes.Remove(compose);
 
     public void Dispose()
@@ -143,6 +162,8 @@ public sealed class GrotheImage : IDisposable
             _loadProgram = null;
             _updateProgram?.Dispose();
             _updateProgram = null;
+            _blendProgram?.Dispose();
+            _blendProgram = null;
             if (_layers != null)
             {
                 foreach (LayerStore layer in _layers) layer.Dispose();

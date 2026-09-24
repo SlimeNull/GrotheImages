@@ -62,11 +62,22 @@
 
 Load 必须把 GPU 结果交给用户内存，所以 staging map 和 CPU 行复制是必要的；除此之外，采样和计算都在 GPU 上完成。Playground 的 PNG/JPEG 导出只在 Load 完成后把输出字节交给 WPF encoder，编码不属于 GrotheImage 的 DX 路径。
 
+## BlendSeams
+
+`BlendSeams` 把每个内部接缝的重叠带混合后写回两个 tile，全程只在 GPU 上做原地修改：
+
+1. 按 layer、平面（YUV 图像是 luma 和 chroma 两个平面）、接缝三重循环枚举，每个接缝一次 compute dispatch；线程数等于重叠带像素数（带宽 = overlap）。
+2. 一个线程读取两个 tile 在同一带内偏移上的两个 texel，算出混合值后**同时写回这两个 texel**。写回的两份完全相同，所以整幅图像只存一份等价数据，重复调用不会继续改变像素。
+3. 相邻两个 tile 落在同一个 page texture 时只绑定一个 UAV（用 slice 区分）；跨越 page 边界时用两个 UAV 绑定两个 page texture，两种情形各有一个 shader 变体。
+4. 相邻两个 tile 只要有一个没写过就跳过这个接缝，避免把空 tile 的零值抹到邻居身上；`TileOverlapX`/`TileOverlapY` 为 0 的方向没有接缝，直接跳过。
+
+成本是 `(列数-1)*行数 + (行数-1)*列数` 次左右的 dispatch（乘 layer 数和平面数），每次 dispatch 的线程数只有重叠带那么大；没有 CPU 回读、没有临时纹理、没有额外的全图 pass。它比 `Update`/`Load` 次数多但每次都很小，属于"填充完成后一次性"的开销。
+
 ## 内存与速度注意事项
 
 - tile array page 是主要常驻显存；未使用的 page 不会因为 Load 自动创建以外的调用而全部分配。
 - `UpdateTile` 的转换中间资源只包含一个 tile，避免为整幅超大图像分配转换缓冲。
 - 直接格式匹配时跳过 shader 和中间资源。
 - 24 位和 YUV 传输格式会在参数校验时拒绝；Playground 使用 WPF 解码器将这类输入图像转换为 BGRA32。
-- 每个 `GrotheImage` 最多创建一个普通 Load program 和一个 Update program；每个被实际加载的 `LayerCompose` 最多创建一个自己的 Load program，重复调用时只创建单次传输纹理。
+- 每个 `GrotheImage` 最多创建一个普通 Load program、一个 Update program 和一个 Blend program；每个被实际加载的 `LayerCompose` 最多创建一个自己的 Load program，重复调用时只创建单次传输纹理。
 - `Shaders/` 下的 HLSL 以 embedded resource 形式随程序集发布，进程内只读取和解析一次（成员重载表）；`CreateLayerCompose` 只做签名匹配，`Load` 不重复解析。C# 侧不拼接 shader 源码，只生成一个 `macros` include：`LAYER_COUNT`、`STORAGE_*`、`MEMBER_LIBRARY` 和 `COMPOSE_PIXEL` 都在其中，shader 用 `#if` 选择分支。只有表达式真的用到成员时 `MEMBER_LIBRARY` 才会被定义，`Common.hlsl` 也才会被 include 进这次编译。

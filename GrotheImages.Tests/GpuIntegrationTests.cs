@@ -533,11 +533,232 @@ public sealed class GpuIntegrationTests
         }
     }
 
+    [Fact]
+    public void BlendSeamsCrossFadesTheOverlapBetweenTiles()
+    {
+        const int tileWidth = 16;
+        const int tileHeight = 4;
+        const int overlap = 8;
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(tileWidth, tileHeight, 1, 2, overlap, 0), PixelFormat.Gray8);
+        UpdateGrayTile(image, 0, 0, tileWidth, tileHeight, 0);
+        UpdateGrayTile(image, 0, 1, tileWidth, tileHeight, 255);
+
+        int width = (int)image.Info.Width;
+        byte[] before = LoadGrayRow(image, width, tileHeight, 0);
+        // Before blending the join is a hard step in the middle of the overlap.
+        Assert.Equal(0, before[11]);
+        Assert.Equal(255, before[12]);
+
+        image.BlendSeams();
+        byte[] after = LoadGrayRow(image, width, tileHeight, 0);
+
+        // Outside the overlap nothing changes.
+        Assert.Equal(0, after[0]);
+        Assert.Equal(0, after[7]);
+        Assert.Equal(255, after[16]);
+        Assert.Equal(255, after[width - 1]);
+
+        // Inside the overlap the two tiles are cross faded with a smoothstep ramp: the first tile loses
+        // weight while the second gains it, and the midpoint of the band is the 50% point.
+        byte[] ramp = { 3, 24, 59, 104, 151, 196, 231, 252 };
+        for (int i = 0; i < ramp.Length; i++)
+            Assert.InRange(after[8 + i], (byte)Math.Max(0, ramp[i] - 2), (byte)Math.Min(255, ramp[i] + 2));
+
+        // Blending again is a no-op, because both tiles now hold the same blended pixels.
+        image.BlendSeams();
+        Assert.Equal(after, LoadGrayRow(image, width, tileHeight, 0));
+    }
+
+    [Fact]
+    public void BlendSeamsCrossFadesRowsAsWell()
+    {
+        const int tileWidth = 4;
+        const int tileHeight = 16;
+        const int overlap = 8;
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(tileWidth, tileHeight, 2, 1, 0, overlap), PixelFormat.Gray8);
+        UpdateGrayTile(image, 0, 0, tileWidth, tileHeight, 0);
+        UpdateGrayTile(image, 1, 0, tileWidth, tileHeight, 255);
+
+        image.BlendSeams();
+
+        int width = (int)image.Info.Width;
+        int height = (int)image.Info.Height;
+        byte[] pixels = LoadGray(image, width, height);
+        byte[] ramp = { 3, 24, 59, 104, 151, 196, 231, 252 };
+        for (int i = 0; i < 8; i++)
+        {
+            Assert.Equal(0, pixels[0 * width + 0]);
+            Assert.Equal(0, pixels[7 * width + 0]);
+            Assert.InRange(pixels[(8 + i) * width + 0], (byte)Math.Max(0, ramp[i] - 2), (byte)Math.Min(255, ramp[i] + 2));
+        }
+        Assert.Equal(255, pixels[16 * width]);
+        Assert.Equal(255, pixels[(height - 1) * width]);
+    }
+
+    [Fact]
+    public void BlendSeamsBlendsTheFourTileCorner()
+    {
+        const int tileWidth = 16;
+        const int tileHeight = 16;
+        const int overlap = 8;
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(tileWidth, tileHeight, 2, 2, overlap, overlap), PixelFormat.Gray8);
+        UpdateGrayTile(image, 0, 0, tileWidth, tileHeight, 0);
+        UpdateGrayTile(image, 0, 1, tileWidth, tileHeight, 100);
+        UpdateGrayTile(image, 1, 0, tileWidth, tileHeight, 200);
+        UpdateGrayTile(image, 1, 1, tileWidth, tileHeight, 255);
+
+        image.BlendSeams();
+
+        int width = (int)image.Info.Width;
+        int height = (int)image.Info.Height;
+        byte[] pixels = LoadGray(image, width, height);
+
+        // Tile interiors keep their own value.
+        Assert.Equal(0, pixels[4 * width + 4]);
+        Assert.Equal(100, pixels[4 * width + 20]);
+        Assert.Equal(200, pixels[20 * width + 4]);
+        Assert.Equal(255, pixels[20 * width + 20]);
+
+        // The four tile corner fades both ways: 0->100 across x and 0->200 down y, so the centre of the
+        // corner holds the separable blend of all four tiles.
+        Assert.InRange(pixels[12 * width + 12], (byte)159, (byte)165);
+        // Away from the corner each band still fades between the two tiles it joins. Row 4 is inside the
+        // top tiles, so it only fades across x; column 4 only fades down y.
+        Assert.InRange(pixels[4 * width + 12], (byte)56, (byte)62);
+        Assert.InRange(pixels[20 * width + 12], (byte)230, (byte)236);
+        Assert.InRange(pixels[12 * width + 4], (byte)116, (byte)122);
+        Assert.InRange(pixels[12 * width + 20], (byte)189, (byte)195);
+    }
+
+    [Fact]
+    public void BlendSeamsLeavesUntouchedTilesAlone()
+    {
+        const int tileWidth = 16;
+        const int tileHeight = 4;
+        const int overlap = 8;
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(tileWidth, tileHeight, 1, 2, overlap, 0), PixelFormat.Gray8);
+        UpdateGrayTile(image, 0, 0, tileWidth, tileHeight, 40);
+
+        int width = (int)image.Info.Width;
+        byte[] before = LoadGrayRow(image, width, tileHeight, 0);
+        image.BlendSeams();
+
+        // The right tile was never written, so its seam is skipped and its zeros are not smeared.
+        Assert.Equal(before, LoadGrayRow(image, width, tileHeight, 0));
+    }
+
+    [Fact]
+    public void BlendSeamsHandlesTilesStoredInDifferentTexturePages()
+    {
+        // Pages hold LayerStore.MaxArraySlices slices, so the seam between tile 2047 and 2048 crosses two
+        // page textures and needs the two UAV shader variant.
+        const int columns = LayerStore.MaxArraySlices + 1;
+        const int tileWidth = 4;
+        const int tileHeight = 1;
+        const int overlap = 2;
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(tileWidth, tileHeight, 1, columns, overlap, 0), PixelFormat.Gray8);
+        UpdateGrayTile(image, 0, LayerStore.MaxArraySlices - 1, tileWidth, tileHeight, 0);
+        UpdateGrayTile(image, 0, LayerStore.MaxArraySlices, tileWidth, tileHeight, 255);
+
+        image.BlendSeams();
+
+        int width = (int)image.Info.Width;
+        byte[] row = LoadGrayRow(image, width, tileHeight, 0);
+        int step = tileWidth - overlap;
+        int seam = (int)(LayerStore.MaxArraySlices - 1) * step + step;
+        // The band is two pixels wide, so the two tiles meet at 25% and 75% of the ramp.
+        Assert.InRange(row[seam], (byte)38, (byte)42);
+        Assert.InRange(row[seam + 1], (byte)213, (byte)217);
+        Assert.Equal(0, row[seam - 1]);
+        Assert.Equal(255, row[seam + 2]);
+    }
+
+    [Fact]
+    public void BlendSeamsFadesTheChromaPlaneOfYuvImagesToo()
+    {
+        const int tileWidth = 16;
+        const int tileHeight = 8;
+        const int overlap = 8;
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(tileWidth, tileHeight, 1, 2, overlap, 0), PixelFormat.Yuv420);
+        UpdateGrayTile(image, 0, 0, tileWidth, tileHeight, 0);
+        UpdateGrayTile(image, 0, 1, tileWidth, tileHeight, 255);
+
+        image.BlendSeams();
+
+        int width = (int)image.Info.Width;
+        byte[] row = LoadGrayRow(image, width, tileHeight, 0);
+        // Y and UV are both faded, so the luma rises across the whole band instead of jumping at the
+        // middle of it, and it still reaches both tile interiors.
+        Assert.InRange(row[0], (byte)0, (byte)4);
+        Assert.InRange(row[width - 1], (byte)251, (byte)255);
+        for (int x = 1; x < width; x++) Assert.True(row[x] >= row[x - 1] - 2, "luma must not step back at x=" + x);
+        // Without blending the join would jump straight from black to the second tile; with both planes
+        // faded no neighbouring pixels differ by more than a fraction of the ramp.
+        for (int x = 1; x < width; x++) Assert.True(row[x] - row[x - 1] <= 60, "luma still steps at x=" + x);
+    }
+
+    [Fact]
+    public void BlendSeamsWithoutOverlapChangesNothing()
+    {
+        using var image = CreateGpuImage(GrotheImageInfo.FromTiles(4, 4, 1, 2), PixelFormat.Gray8);
+        UpdateGrayTile(image, 0, 0, 4, 4, 10);
+        UpdateGrayTile(image, 0, 1, 4, 4, 200);
+
+        byte[] before = LoadGray(image, (int)image.Info.Width, (int)image.Info.Height);
+        image.BlendSeams();
+        Assert.Equal(before, LoadGray(image, (int)image.Info.Width, (int)image.Info.Height));
+    }
+
+    private static void UpdateGrayTile(GrotheImage image, long row, long column, int width, int height, byte value)
+    {
+        byte[] source = new byte[width * height];
+        for (int i = 0; i < source.Length; i++) source[i] = value;
+        IntPtr pointer = Marshal.AllocHGlobal(source.Length);
+        try
+        {
+            Marshal.Copy(source, 0, pointer, source.Length);
+            image.UpdateTile(0, row, column, pointer, width, height, width, PixelFormat.Gray8);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pointer);
+        }
+    }
+
+    private static byte[] LoadGray(GrotheImage image, int width, int height)
+    {
+        IntPtr output = Marshal.AllocHGlobal(width * height);
+        try
+        {
+            image.Load(0, output, width, height, width, PixelFormat.Gray8, TransformMatrix.Identity);
+            byte[] result = new byte[width * height];
+            Marshal.Copy(output, result, 0, result.Length);
+            return result;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(output);
+        }
+    }
+
+    private static byte[] LoadGrayRow(GrotheImage image, int width, int height, int row)
+    {
+        byte[] all = LoadGray(image, width, height);
+        var result = new byte[width];
+        Array.Copy(all, row * width, result, 0, width);
+        return result;
+    }
+
     private static GrotheImage CreateGpuImage(PixelFormat format, int width, int height, params string[] layers)
+    {
+        return CreateGpuImage(new GrotheImageInfo(width, height, width, height), format, layers);
+    }
+
+    private static GrotheImage CreateGpuImage(GrotheImageInfo info, PixelFormat format, params string[] layers)
     {
         try
         {
-            return new GrotheImage(new GrotheImageInfo(width, height, width, height), format, layers.Length == 0 ? new[] { "a" } : layers);
+            return new GrotheImage(info, format, layers.Length == 0 ? new[] { "a" } : layers);
         }
         catch (Exception ex) when (ex is GrotheImageException || ex is DllNotFoundException || ex is TypeInitializationException)
         {

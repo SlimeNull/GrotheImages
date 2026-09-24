@@ -31,6 +31,12 @@ internal sealed class LayerStore : IDisposable
         _writtenTiles.Add(TileGrid.GetLinearIndex(_info, row, column));
     }
 
+    /// <summary>True when the tile already holds data, used to avoid blending zeros into a neighbour.</summary>
+    public bool IsWritten(long row, long column)
+    {
+        return _writtenTiles.Contains(TileGrid.GetLinearIndex(_info, row, column));
+    }
+
     public TileArrayPage GetPageForTile(long row, long column, out int slice)
     {
         long linear = TileGrid.GetLinearIndex(_info, row, column);
@@ -76,16 +82,16 @@ internal sealed class TileArrayPage : IDisposable
                 Color = new TileArrayResource(graphics, DxgiFormat.R8G8B8A8_UNorm, info.TileWidth, info.TileHeight, arraySize, false);
                 break;
             case PixelFormat.Yuv444:
-                Y = new TileArrayResource(graphics, DxgiFormat.R8_UNorm, info.TileWidth, info.TileHeight, arraySize, false);
-                Uv = new TileArrayResource(graphics, DxgiFormat.R8G8_UNorm, info.TileWidth, info.TileHeight, arraySize, false);
-                break;
             case PixelFormat.Yuv422:
-                Y = new TileArrayResource(graphics, DxgiFormat.R8_UNorm, info.TileWidth, info.TileHeight, arraySize, false);
-                Uv = new TileArrayResource(graphics, DxgiFormat.R8G8_UNorm, info.TileWidth / 2, info.TileHeight, arraySize, false);
-                break;
             case PixelFormat.Yuv420:
                 Y = new TileArrayResource(graphics, DxgiFormat.R8_UNorm, info.TileWidth, info.TileHeight, arraySize, false);
-                Uv = new TileArrayResource(graphics, DxgiFormat.R8G8_UNorm, info.TileWidth / 2, info.TileHeight / 2, arraySize, false);
+                Uv = new TileArrayResource(
+                    graphics,
+                    DxgiFormat.R8G8_UNorm,
+                    info.TileWidth / PixelFormatRules.ChromaSubsampleX(format),
+                    info.TileHeight / PixelFormatRules.ChromaSubsampleY(format),
+                    arraySize,
+                    false);
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(format));

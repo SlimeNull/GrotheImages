@@ -92,6 +92,22 @@ public partial class MainWindow : Window
         });
     }
 
+    private void BlendSeamsClick(object sender, RoutedEventArgs e)
+    {
+        Run(() =>
+        {
+            RequireImage();
+            if (SeamCount(_image.Info) == 0)
+            {
+                StatusText.Text = "This layout has no overlap, so there are no seams to blend.";
+                return;
+            }
+            _image.BlendSeams();
+            RefreshLoadSelector();
+            StatusText.Text = "Blended " + SeamCount(_image.Info) + " seams per layer" + (IsYuv(_image.Format) ? " and plane" : "") + ".";
+        });
+    }
+
     private void LoadExportClick(object sender, RoutedEventArgs e)
     {
         Run(() =>
@@ -327,12 +343,18 @@ public partial class MainWindow : Window
             LoadPerspective.SetImage(null);
             TileStorageInfo.Text = "Create or open an image first.";
             TileFileInfo.Text = "Create or open a GrotheImage first.";
+            BlendInfo.Text = "Create or open a GrotheImage first.";
             return;
         }
         PreviewLayer.ItemsSource = _image.LayerNames;
         PreviewLayer.SelectedIndex = 0;
         PreviewImage.Source = null;
         TileStorageInfo.Text = _image.Format + ", tile " + _image.Info.TileWidth + " x " + _image.Info.TileHeight;
+        long seams = SeamCount(_image.Info);
+        BlendInfo.Text = seams == 0
+            ? "Overlap X and Y are 0, so neighbouring tiles do not share any pixels and there is nothing to blend."
+            : "Overlap " + _image.Info.TileOverlapX + " x " + _image.Info.TileOverlapY + ": " + seams + " seams per layer"
+              + (IsYuv(_image.Format) ? ", blended on the luma and chroma planes." : ".");
         TryRefresh(RefreshTileFileInfo);
     }
 
@@ -381,6 +403,15 @@ public partial class MainWindow : Window
     private void RequireImage() { if (_image == null) throw new InvalidOperationException("Create or open a GrotheImage first."); }
     private static void TryRefresh(Action action) { try { action(); } catch { } }
     private static bool IsSubsampled(PixelFormat format) => format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420;
+    private static bool IsYuv(PixelFormat format) => format == PixelFormat.Yuv444 || IsSubsampled(format);
+
+    /// <summary>Neighbouring tile pairs of one plane, matching GrotheImage.BlendSeams.</summary>
+    private static long SeamCount(GrotheImageInfo info)
+    {
+        long alongX = info.TileOverlapX == 0 ? 0 : (info.TileColumns - 1) * info.TileRows;
+        long alongY = info.TileOverlapY == 0 ? 0 : (info.TileRows - 1) * info.TileColumns;
+        return alongX + alongY;
+    }
     private static bool IsTransferFormat(PixelFormat format) => format == PixelFormat.Bgra32 || format == PixelFormat.Rgba32 || format == PixelFormat.Gray8;
     private static int BytesPerPixel(PixelFormat format) => format == PixelFormat.Gray8 ? 1 : 4;
     private static int Int(System.Windows.Controls.TextBox box) => int.Parse(box.Text);

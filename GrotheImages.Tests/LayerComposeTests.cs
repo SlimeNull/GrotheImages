@@ -41,6 +41,9 @@ public sealed class LayerComposeTests
         // A swizzle may not select channels the operand does not have, nor more than four channels.
         Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.rgb.a"));
         Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.rrrrr"));
+        // A swizzle is not a function, so it cannot be called.
+        FormatException swizzleCall = Assert.Throws<FormatException>(() => image.CreateLayerCompose("a.rgb(0.5)"));
+        Assert.Contains("selects channels and cannot be called with arguments", swizzleCall.Message);
     }
 
     [Fact]

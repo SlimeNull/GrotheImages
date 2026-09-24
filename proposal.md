@@ -311,6 +311,8 @@ public sealed class GrotheImage : IDisposable
         int stride,
         PixelFormat format);
 
+    public void BlendSeams();
+
 }
 ```
 
@@ -406,6 +408,34 @@ float4 value = TileArray.SampleLevel(LinearSampler, float3(uv, slice), 0);
 ```
 
 实际实现会把 `slice` 拆成 page 和 page-local slice，并对 YUV UV array 使用对应的二分之一坐标。`floor(source - overlap/2)` 体现采样归属规则：例如边界 `95` 之后选择第二个 tile，而不是把整个 `[90,100)` overlap 交给第一个 tile。
+
+### 6.4 tile 缝合：`BlendSeams`
+
+工业相机可以精确控制拍照位置，让相邻 tile 的重叠区域在几何上对应同一块物面，但两次曝光的亮度和噪声不可能完全一致，所以采样归属中线两侧仍然是一条硬边。`BlendSeams` 在重叠区域把相邻两个 tile 交叉淡化成一条渐变，把这条硬边抹掉：
+
+```csharp
+using (var image = new GrotheImage(GrotheImageInfo.FromTiles(2048, 2048, 4, 4, 64, 64), PixelFormat.Bgra32, "a"))
+{
+    for (long row = 0; row < 4; row++)
+        for (long column = 0; column < 4; column++)
+            image.UpdateTile(0, row, column, tilePointer(row, column), 2048, 2048, stride, PixelFormat.Bgra32);
+
+    image.BlendSeams();   // 全部 tile 写完之后调用一次
+    image.Load(0, output, width, height, stride, PixelFormat.Bgra32, TransformMatrix.Identity);
+}
+```
+
+语义：
+
+- **一次处理整幅图像**：遍历每个 layer 的每一对相邻 tile，水平接缝和垂直接缝都处理；`TileOverlapX`/`TileOverlapY` 为 0 的方向没有接缝，直接跳过，两个方向都为 0 时整个调用是空操作。
+- **在重叠带内交叉淡化**：带宽就是 overlap。设带内偏移 `o ∈ [0, overlap)`，第二个 tile 的权重是 `smoothstep(0, 1, (o + 0.5) / overlap)`，第一个 tile 取 `1 - 权重`。渐变正好以采样归属中线为 50% 点，所以 `Load` 的归属规则不需要改，硬边两侧的值变成连续过渡。
+- **写回两份副本**：重叠区域在每个 tile 里各存了一份，混合结果同时写回两个 tile，保持“同一块物面的两份存储完全一致”这个不变式；因此重复调用不会继续改变像素（幂等），序列化出来的数据也已经是缝合好的。
+- **跳过没写过的 tile**：只有相邻两个 tile 都已写入才混合，避免把一个空 tile 的零值抹到邻居身上；只补了一部分 tile 的图像可以在补完后调用，之后继续补 tile 再调用一次。
+- **所有存储格式**：Bgra32/Rgba32 混合 4 通道，Gray8 混合单通道；YUV 图像的 luma 平面按 tile 尺寸混合，chroma 平面按自己的子采样尺寸（422 横半、420 横半竖半）和对应缩小的 overlap 混合，两遍都做完再解码，所以 YUV 图像同样看不到接缝。
+- **成本**：每个接缝、每个平面一次 compute dispatch，线程数就是重叠带的像素数；没有 CPU 回读，也没有临时纹理。dispatch 数量是 `(列数-1)*行数 + (行数-1)*列数` 的量级（再乘 layer 数和平面数），带内像素只占全图很小一部分。
+- **不该做的事**：不做几何对齐、不做亮度补偿、不做多帧融合，只做重叠带内的线性交叉淡化——位置对齐由相机负责，剩下的是把硬边变成渐变。
+
+它和参考工程 `Holly.Imaging.DX` 的 `BlendEdge(block1, block2, isHorizontal)` 思路一致（都是把两份重叠副本混合后写回），差别是接口：那边由调用方逐对 tile 调用，这边一次覆盖整幅图像的全部接缝。
 
 ## 7. LayerCompose 与表达式编译
 
@@ -512,6 +542,7 @@ a.bin(b.r)            -> bin(layers[0], (float4)(layers[1].r))
 | --- | --- |
 | `Shaders/Load.hlsl` | Load 的 vertex + pixel shader；声明 layer 资源数组、采样 accessor、tile 归属计算和输出转换 |
 | `Shaders/Update.hlsl` | Update/UpdateTile 的 compute shader；采样上传纹理并写入 tile UAV |
+| `Shaders/Blend.hlsl` | `BlendSeams` 的 compute shader；把一对相邻 tile 的重叠带交叉淡化后写回两份副本 |
 | `Shaders/Common.hlsl` | 表达式成员函数库（`lum`、`hsv`、`bin` 等），只在表达式用到成员时被 include |
 | `Shaders/macros` | `macros` include 的默认内容，供编辑器/离线编译单独编译 shader 时使用 |
 

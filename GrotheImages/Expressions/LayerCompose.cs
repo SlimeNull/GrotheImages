@@ -472,6 +472,10 @@ internal static class ExpressionCompiler
                     // Intrinsics are HLSL builtins, so only a real library function needs Common.hlsl.
                     if (!ShaderLibrary.IsIntrinsic(nameToken.Text)) UsesMemberExpression = true;
                 }
+                else if (call && IsSwizzle(nameToken.Text))
+                {
+                    throw Error("'" + nameToken.Text + "' selects channels and cannot be called with arguments.", nameToken);
+                }
                 else if (call)
                 {
                     throw Error("Unknown member '" + nameToken.Text + "'. Available members: " + string.Join(", ", ShaderLibrary.MemberNames.ToArray()) + ".", nameToken);

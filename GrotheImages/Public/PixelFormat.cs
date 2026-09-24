@@ -24,6 +24,18 @@ internal static class PixelFormatRules
         return format == PixelFormat.Yuv444 || format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420;
     }
 
+    /// <summary>Horizontal subsampling factor of the chroma plane (1 for 4:4:4 and non-YUV formats).</summary>
+    public static int ChromaSubsampleX(PixelFormat format)
+    {
+        return format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420 ? 2 : 1;
+    }
+
+    /// <summary>Vertical subsampling factor of the chroma plane (2 only for 4:2:0).</summary>
+    public static int ChromaSubsampleY(PixelFormat format)
+    {
+        return format == PixelFormat.Yuv420 ? 2 : 1;
+    }
+
     public static bool IsTransferFormat(PixelFormat format) =>
         format == PixelFormat.Bgra32 || format == PixelFormat.Rgba32 || format == PixelFormat.Gray8;
 
