@@ -82,6 +82,25 @@ public sealed class LayerComposeTests
     }
 
     [Fact]
+    public void MissingExpressionChannelsArePaddedInTheGeneratedShader()
+    {
+        using var image = CreateImage();
+
+        string Shader(string expression) => LoadProgram.BuildShaderSource(image, image.CreateLayerCompose(expression));
+
+        Assert.Contains("float4 Layer0 = ReadLayer0", Shader("a.rgba"));
+        Assert.Contains("float4 value = float4(Layer0.rgba);", Shader("a.rgba"));
+        // Three channels keep their order, alpha becomes one.
+        Assert.Contains("float4 value = float4(Layer0.rgb, 1);", Shader("a.rgb"));
+        // Two channels keep their order, blue becomes zero and alpha becomes one.
+        Assert.Contains("float4 value = float4(Layer0.gb, 0, 1);", Shader("a.gb"));
+        // One channel is replicated across red, green and blue with alpha of one.
+        Assert.Contains("float4 value = float4(lum(Layer0), lum(Layer0), lum(Layer0), 1);", Shader("a.lum"));
+        // Channels mean nothing by themselves: only the position in the result list matters.
+        Assert.Contains("float4 value = float4(Layer0.a, Layer0.r, Layer0.g, Layer0.b);", Shader("a.a, a.r, a.g, a.b"));
+    }
+
+    [Fact]
     public void OnlyMembersDeclaredInTheShaderLibraryAreAccepted()
     {
         using var image = CreateImage();

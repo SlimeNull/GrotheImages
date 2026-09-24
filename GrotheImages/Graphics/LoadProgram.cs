@@ -51,7 +51,6 @@ internal sealed class LoadProgram : IDisposable
 
     public void Execute(int layerIndex, nint output, int width, int height, int stride, PixelFormat format, TransformMatrix inverse)
     {
-        if (_compose != null) ValidateComposeOutput(_compose, format);
         GrotheImage image = _image;
         DxgiFormat renderFormat = GetRenderFormat(format);
             ID3D11Texture2D render = image.Graphics.Device.CreateTexture2D(
@@ -169,14 +168,7 @@ internal sealed class LoadProgram : IDisposable
         }
     }
 
-    private static void ValidateComposeOutput(LayerCompose compose, PixelFormat format)
-    {
-        int expected = format == PixelFormat.Gray8 ? 1 : 4;
-        if (compose.OutputChannelCount != expected)
-            throw new ArgumentException("The compose expression channel count does not match the requested output format.", nameof(compose));
-    }
-
-    private static string BuildShaderSource(GrotheImage image, LayerCompose compose)
+    internal static string BuildShaderSource(GrotheImage image, LayerCompose compose)
     {
         int layerCount = compose == null ? 1 : image.LayerNames.Count;
         bool yuv = image.Format == PixelFormat.Yuv444 || image.Format == PixelFormat.Yuv422 || image.Format == PixelFormat.Yuv420;
@@ -232,8 +224,22 @@ internal sealed class LoadProgram : IDisposable
         {
             for (int i = 0; i < layerCount; i++) b.Append("float4 Layer").Append(i).AppendLine(" = ReadLayer" + i + "(uv, slice);");
             string expression = compose.ToHlsl();
-            if (compose.OutputChannelCount == 1) expression = expression + "," + expression + "," + expression + ",1";
-            else if (compose.OutputChannelCount == 3) expression += ",1";
+            // An expression with fewer than four channels is padded into a complete pixel:
+            // 1 -> (x, x, x, 1), 2 -> (x, y, 0, 1), 3 -> (x, y, z, 1). Missing color channels become
+            // zero, a missing alpha becomes one. The expression only defines positions, never channel
+            // meaning: 'a.a, a.r, a.g, a.b' really puts alpha first. A Gray8 render target keeps red.
+            switch (compose.OutputChannelCount)
+            {
+                case 1:
+                    expression = expression + ", " + expression + ", " + expression + ", 1";
+                    break;
+                case 2:
+                    expression += ", 0, 1";
+                    break;
+                case 3:
+                    expression += ", 1";
+                    break;
+            }
             b.AppendLine("float4 value = float4(" + expression + ");");
         }
         b.AppendLine("return ToOutput(value);");

@@ -408,6 +408,58 @@ public sealed class GpuIntegrationTests
     }
 
     [Fact]
+    public void ComposeExpressionsWithFewerThanFourChannelsArePadded()
+    {
+        IntPtr outputPtr = Marshal.AllocHGlobal(4);
+        IntPtr aPtr = Marshal.AllocHGlobal(4);
+        try
+        {
+            Marshal.Copy(new byte[] { 10, 20, 30, 255 }, 0, aPtr, 4);
+            using var image = CreateGpuImage(PixelFormat.Rgba32, 1, 1);
+            image.UpdateTile(0, 0, 0, aPtr, 1, 1, 4, PixelFormat.Rgba32);
+
+            void AssertPixel(string expression, params byte[] expected)
+            {
+                using (var compose = image.CreateLayerCompose(expression))
+                    image.Load(compose, outputPtr, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+                byte[] result = new byte[4];
+                Marshal.Copy(outputPtr, result, 0, 4);
+                for (int i = 0; i < 4; i++) Assert.InRange(result[i], (byte)Math.Max(0, expected[i] - 2), (byte)Math.Min(255, expected[i] + 2));
+            }
+
+            void AssertGray(string expression, byte expected)
+            {
+                using (var compose = image.CreateLayerCompose(expression))
+                    image.Load(compose, outputPtr, 1, 1, 1, PixelFormat.Gray8, TransformMatrix.Identity);
+                byte[] result = new byte[1];
+                Marshal.Copy(outputPtr, result, 0, 1);
+                Assert.InRange(result[0], (byte)Math.Max(0, expected - 2), (byte)Math.Min(255, expected + 2));
+            }
+
+            AssertPixel("a.rgba", 10, 20, 30, 255);
+            // Three channels: alpha is padded with one.
+            AssertPixel("a.rgb", 10, 20, 30, 255);
+            // Two channels: blue becomes zero, alpha is padded with one.
+            AssertPixel("a.gb", 20, 30, 0, 255);
+            // One channel: red, green and blue all carry the expression result.
+            AssertPixel("a.lum", 18, 18, 18, 255);
+            // Channels carry no meaning, only the position in the list does.
+            AssertPixel("a.a, a.r, a.g, a.b", 255, 10, 20, 30);
+
+            // A Gray8 target stores one channel and keeps red, whatever the expression produced.
+            AssertGray("a.lum", 18);
+            AssertGray("a.r", 10);
+            AssertGray("a.rgb", 10);
+            AssertGray("a.a, a.r, a.g, a.b", 255);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(outputPtr);
+            Marshal.FreeHGlobal(aPtr);
+        }
+    }
+
+    [Fact]
     public void TextureArrayPagesAreSelectedByLoadShader()
     {
         const int columns = 2050;
