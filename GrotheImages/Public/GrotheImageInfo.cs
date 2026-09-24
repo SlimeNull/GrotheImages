@@ -2,7 +2,7 @@ using System;
 
 namespace GrotheImages;
 
-public sealed class GrotheImageInfo
+public readonly struct GrotheImageInfo
 {
     public GrotheImageInfo(
         long width,
@@ -111,7 +111,7 @@ public sealed class GrotheImageInfo
         return (int)value;
     }
 
-    private void ValidateComputedValues()
+    internal void ValidateComputedValues()
     {
         if (TileWidth <= 0) throw new ArgumentOutOfRangeException(nameof(TileWidth));
         if (TileHeight <= 0) throw new ArgumentOutOfRangeException(nameof(TileHeight));

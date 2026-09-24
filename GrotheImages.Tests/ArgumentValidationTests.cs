@@ -23,12 +23,20 @@ public sealed class ArgumentValidationTests
         Assert.Throws<ArgumentException>(() => new GrotheImage(info, PixelFormat.Gray8, "a", "a"));
     }
 
-    [Fact]
-    public void PackedSubsampledFormatsAreRejectedByUpdateAndLoad()
+    [Theory]
+    [InlineData(PixelFormat.Bgr24)]
+    [InlineData(PixelFormat.Rgb24)]
+    [InlineData(PixelFormat.Yuv444)]
+    [InlineData(PixelFormat.Yuv422)]
+    [InlineData(PixelFormat.Yuv420)]
+    public void UnsupportedTransferFormatsAreRejected(PixelFormat format)
     {
         using var image = new GrotheImage(new GrotheImageInfo(16, 16, 16, 16), PixelFormat.Rgba32, "a");
-        Assert.Throws<ArgumentException>(() => image.Update(0, (nint)1, 1, 1, 2, PixelFormat.Yuv422, TransformMatrix.Identity));
-        Assert.Throws<ArgumentException>(() => image.Load(0, (nint)1, 1, 1, 4, PixelFormat.Yuv420, TransformMatrix.Identity));
+        using var compose = image.CreateLayerCompose("a.r, a.g, a.b, 1");
+        Assert.Throws<ArgumentException>(() => image.Update(0, (nint)1, 1, 1, 4, format, TransformMatrix.Identity));
+        Assert.Throws<ArgumentException>(() => image.Load(0, (nint)1, 1, 1, 4, format, TransformMatrix.Identity));
+        Assert.Throws<ArgumentException>(() => image.Load(compose, (nint)1, 1, 1, 4, format, TransformMatrix.Identity));
+        Assert.Throws<ArgumentException>(() => image.UpdateTile(0, 0, 0, (nint)1, 16, 16, 64, format));
     }
 
     [Fact]
@@ -36,5 +44,11 @@ public sealed class ArgumentValidationTests
     {
         using var image = new GrotheImage(new GrotheImageInfo(4, 2, 4, 2), PixelFormat.Yuv422, "a");
         Assert.Throws<ArgumentException>(() => image.UpdateTile(0, 0, 0, (nint)1, 4, 2, 8, PixelFormat.Yuv422));
+    }
+
+    [Fact]
+    public void DefaultImageInfoCannotCreateAnImage()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new GrotheImage(default(GrotheImageInfo), PixelFormat.Gray8, "a"));
     }
 }

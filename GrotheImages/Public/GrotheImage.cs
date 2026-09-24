@@ -11,11 +11,15 @@ public sealed class GrotheImage : IDisposable
     private readonly object _sync = new object();
     private D3D11DeviceContext _graphics;
     private LayerStore[] _layers;
+    private LoadProgram _loadProgram;
+    private UpdateProgram _updateProgram;
+    private readonly HashSet<LayerCompose> _composes = new HashSet<LayerCompose>();
     private bool _disposed;
 
     public GrotheImage(GrotheImageInfo info, PixelFormat format, params string[] layerNames)
     {
-        Info = info ?? throw new ArgumentNullException(nameof(info));
+        info.ValidateComputedValues();
+        Info = info;
         Info.ValidateForFormat(format);
         Format = format;
         if (layerNames == null || layerNames.Length == 0) throw new ArgumentException("At least one layer is required.", nameof(layerNames));
@@ -86,7 +90,10 @@ public sealed class GrotheImage : IDisposable
         lock (_sync)
         {
             ThrowIfDisposed();
-            return ExpressionCompiler.Compile(expression, LayerNames);
+            var compose = ExpressionCompiler.Compile(expression, LayerNames);
+            compose.Attach(this);
+            _composes.Add(compose);
+            return compose;
         }
     }
 
@@ -96,6 +103,7 @@ public sealed class GrotheImage : IDisposable
         lock (_sync)
         {
             ThrowIfDisposed();
+            if (!ReferenceEquals(layerCompose.Owner, this)) throw new ArgumentException("The layer composition belongs to another image or has been disposed.", nameof(layerCompose));
             ValidateTransferArguments(scan0, width, height, stride, format, transformMatrix);
             EnsureGraphics();
             GpuImageProcessor.Load(this, -1, layerCompose, scan0, width, height, stride, format, transformMatrix);
@@ -110,28 +118,7 @@ public sealed class GrotheImage : IDisposable
             ValidateLayerIndex(layerIndex);
             ValidateTileArguments(tileRow: tileRow, tileColumn: tileColumn, scan0, width, height, stride, format);
             EnsureGraphics();
-            GpuImageProcessor.UpdateTile(this, layerIndex, tileRow, tileColumn, scan0, width, height, stride, format, IntPtr.Zero, 0, 0, format);
-        }
-    }
-
-    public void UpdateTile(int layerIndex, long tileRow, long tileColumn, nint yScan0, int yStride, nint uvScan0, int uvStride, PixelFormat format)
-    {
-        lock (_sync)
-        {
-            ThrowIfDisposed();
-            ValidateLayerIndex(layerIndex);
-            if (format != PixelFormat.Yuv422 && format != PixelFormat.Yuv420)
-                throw new ArgumentException("The two-plane UpdateTile overload is only valid for Yuv422 or Yuv420.", nameof(format));
-            if (format == PixelFormat.Yuv422 && (Info.TileWidth & 1) != 0)
-                throw new ArgumentException("Yuv422 input requires an even tile width.", nameof(format));
-            if (format == PixelFormat.Yuv420 && ((Info.TileWidth & 1) != 0 || (Info.TileHeight & 1) != 0))
-                throw new ArgumentException("Yuv420 input requires even tile dimensions.", nameof(format));
-            if (yScan0 == 0 || uvScan0 == 0) throw new ArgumentNullException(nameof(yScan0));
-            if (yStride < Info.TileWidth) throw new ArgumentOutOfRangeException(nameof(yStride));
-            if (uvStride < checked((Info.TileWidth / 2) * 2)) throw new ArgumentOutOfRangeException(nameof(uvStride));
-            TileGrid.GetLinearIndex(Info, tileRow, tileColumn);
-            EnsureGraphics();
-            GpuImageProcessor.UpdateTile(this, layerIndex, tileRow, tileColumn, yScan0, Info.TileWidth, Info.TileHeight, yStride, format, uvScan0, Info.TileWidth / 2, uvStride, format);
+            GpuImageProcessor.UpdateTile(this, layerIndex, tileRow, tileColumn, scan0, width, height, stride, format);
         }
     }
 
@@ -139,6 +126,10 @@ public sealed class GrotheImage : IDisposable
     internal LayerStore GetLayer(int index) => _layers[index];
     internal bool HasTileStorage => _layers != null;
     internal void EnsureGraphicsForSerialization() => EnsureGraphics();
+    internal object SyncRoot => _sync;
+    internal LoadProgram GetLoadProgram() => _loadProgram ?? (_loadProgram = new LoadProgram(this, null));
+    internal UpdateProgram GetUpdateProgram() => _updateProgram ?? (_updateProgram = new UpdateProgram());
+    internal void ReleaseCompose(LayerCompose compose) => _composes.Remove(compose);
 
     public void Dispose()
     {
@@ -146,6 +137,12 @@ public sealed class GrotheImage : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            foreach (LayerCompose compose in _composes) compose.DisposeProgram();
+            _composes.Clear();
+            _loadProgram?.Dispose();
+            _loadProgram = null;
+            _updateProgram?.Dispose();
+            _updateProgram = null;
             if (_layers != null)
             {
                 foreach (LayerStore layer in _layers) layer.Dispose();
@@ -180,7 +177,7 @@ public sealed class GrotheImage : IDisposable
         TileGrid.GetLinearIndex(Info, tileRow, tileColumn);
         if (scan0 == 0) throw new ArgumentNullException(nameof(scan0));
         if (width != Info.TileWidth || height != Info.TileHeight) throw new ArgumentException("Every tile has the same full storage dimensions.");
-        if (format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420) throw new ArgumentException("Use the Y/UV UpdateTile overload for subsampled YUV.", nameof(format));
+        PixelFormatRules.ValidateTransferFormat(format, nameof(format));
         if (stride <= 0 || stride < checked(width * PixelFormatRules.BytesPerPixel(format))) throw new ArgumentOutOfRangeException(nameof(stride));
     }
 

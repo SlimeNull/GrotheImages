@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Runtime.InteropServices;
 using System.Text;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -13,20 +12,16 @@ internal sealed class LoadProgram : IDisposable
 {
     private readonly GrotheImage _image;
     private readonly LayerCompose _compose;
-    private readonly PixelFormat _outputFormat;
     private readonly ID3D11VertexShader _vertexShader;
     private readonly ID3D11PixelShader _pixelShader;
     private readonly ID3D11SamplerState _sampler;
     private readonly ID3D11Buffer _constants;
 
-    public LoadProgram(GrotheImage image, LayerCompose compose, PixelFormat outputFormat)
+    public LoadProgram(GrotheImage image, LayerCompose compose)
     {
         _image = image;
         _compose = compose;
-        _outputFormat = outputFormat;
-        if (compose != null) ValidateComposeOutput(compose, outputFormat);
-
-        string source = BuildShaderSource(image, compose, outputFormat);
+        string source = BuildShaderSource(image, compose);
         using (Blob vsBlob = ShaderCompiler.Compile(source, "VSMain", "vs_5_0"))
         using (Blob psBlob = ShaderCompiler.Compile(source, "PSMain", "ps_5_0"))
         {
@@ -54,9 +49,11 @@ internal sealed class LoadProgram : IDisposable
             0);
     }
 
-    public void Execute(GrotheImage image, int layerIndex, nint output, int width, int height, int stride, TransformMatrix inverse)
+    public void Execute(int layerIndex, nint output, int width, int height, int stride, PixelFormat format, TransformMatrix inverse)
     {
-        DxgiFormat renderFormat = GetRenderFormat(_outputFormat);
+        if (_compose != null) ValidateComposeOutput(_compose, format);
+        GrotheImage image = _image;
+        DxgiFormat renderFormat = GetRenderFormat(format);
             ID3D11Texture2D render = image.Graphics.Device.CreateTexture2D(
                 renderFormat, width, height, 1, 1, null,
                 BindFlags.RenderTarget,
@@ -101,7 +98,7 @@ internal sealed class LoadProgram : IDisposable
                 }
                 image.Graphics.Context.CopyResource(staging, render);
                 image.Graphics.Context.Flush();
-                Readback(image.Graphics.Context, staging, output, width, height, stride, _outputFormat);
+                Readback(image.Graphics.Context, staging, output, width, height, stride, format);
             }
             finally
             {
@@ -174,12 +171,12 @@ internal sealed class LoadProgram : IDisposable
 
     private static void ValidateComposeOutput(LayerCompose compose, PixelFormat format)
     {
-        int expected = format == PixelFormat.Gray8 ? 1 : (format == PixelFormat.Bgra32 || format == PixelFormat.Rgba32 ? 4 : 3);
+        int expected = format == PixelFormat.Gray8 ? 1 : 4;
         if (compose.OutputChannelCount != expected)
             throw new ArgumentException("The compose expression channel count does not match the requested output format.", nameof(compose));
     }
 
-    private static string BuildShaderSource(GrotheImage image, LayerCompose compose, PixelFormat outputFormat)
+    private static string BuildShaderSource(GrotheImage image, LayerCompose compose)
     {
         int layerCount = compose == null ? 1 : image.LayerNames.Count;
         bool yuv = image.Format == PixelFormat.Yuv444 || image.Format == PixelFormat.Yuv422 || image.Format == PixelFormat.Yuv420;
@@ -214,10 +211,8 @@ internal sealed class LoadProgram : IDisposable
             b.AppendLine("}");
         }
         b.AppendLine("float4 ToOutput(float4 value) {");
-        if (yuv && outputFormat != PixelFormat.Yuv444)
+        if (yuv)
             b.AppendLine("float yy = (value.x - 0.0625) * 1.1643836; float uu = value.y - 0.5; float vv = value.z - 0.5; return float4(yy + 1.7927415*vv, yy - 0.2132486*uu - 0.5329093*vv, yy + 2.1124018*uu, 1);");
-        else if (!yuv && outputFormat == PixelFormat.Yuv444)
-            b.AppendLine("float yy = dot(value.rgb, float3(0.2126,0.7152,0.0722)); return float4(yy, (value.b-yy)*0.5389+0.5, (value.r-yy)*0.6350+0.5, 1);");
         else
             b.AppendLine("return value;");
         b.AppendLine("}");
@@ -239,38 +234,15 @@ internal sealed class LoadProgram : IDisposable
         return b.ToString();
     }
 
-    private static void Readback(ID3D11DeviceContext context, ID3D11Texture2D staging, nint destination, int width, int height, int stride, PixelFormat format)
+    private static unsafe void Readback(ID3D11DeviceContext context, ID3D11Texture2D staging, nint destination, int width, int height, int stride, PixelFormat format)
     {
         MappedSubresource mapped = context.Map(staging, 0, MapMode.Read, MapFlags.None);
         try
         {
-            int sourceBytes = format == PixelFormat.Gray8 ? width : width * 4;
-            byte[] row = new byte[sourceBytes];
-            byte[] output = new byte[format == PixelFormat.Gray8 ? width : width * PixelFormatRules.BytesPerPixel(format)];
+            int rowBytes = checked(width * PixelFormatRules.BytesPerPixel(format));
             for (int y = 0; y < height; y++)
             {
-                Marshal.Copy(mapped.DataPointer + y * mapped.RowPitch, row, 0, row.Length);
-                if (format == PixelFormat.Bgr24 || format == PixelFormat.Rgb24)
-                {
-                    for (int x = 0; x < width; x++)
-                    {
-                        int si = x * 4;
-                        int di = x * 3;
-                        if (format == PixelFormat.Bgr24) { output[di] = row[si + 2]; output[di + 1] = row[si + 1]; output[di + 2] = row[si]; }
-                        else { output[di] = row[si]; output[di + 1] = row[si + 1]; output[di + 2] = row[si + 2]; }
-                    }
-                }
-                else if (format == PixelFormat.Yuv444)
-                {
-                    for (int x = 0; x < width; x++)
-                    {
-                        int si = x * 4;
-                        int di = x * 3;
-                        output[di] = row[si]; output[di + 1] = row[si + 1]; output[di + 2] = row[si + 2];
-                    }
-                }
-                else Buffer.BlockCopy(row, 0, output, 0, output.Length);
-                Marshal.Copy(output, 0, destination + y * stride, output.Length);
+                Buffer.MemoryCopy((void*)(mapped.DataPointer + y * mapped.RowPitch), (void*)(destination + y * stride), stride, rowBytes);
             }
         }
         finally

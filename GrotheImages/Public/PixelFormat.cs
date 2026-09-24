@@ -21,10 +21,8 @@ internal static class PixelFormatRules
         return format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420;
     }
 
-    public static bool IsTransferFormat(PixelFormat format)
-    {
-        return !IsSubsampledYuv(format);
-    }
+    public static bool IsTransferFormat(PixelFormat format) =>
+        format == PixelFormat.Bgra32 || format == PixelFormat.Rgba32 || format == PixelFormat.Gray8;
 
     public static int BytesPerPixel(PixelFormat format)
     {
@@ -33,21 +31,16 @@ internal static class PixelFormatRules
             case PixelFormat.Bgra32:
             case PixelFormat.Rgba32:
                 return 4;
-            case PixelFormat.Bgr24:
-            case PixelFormat.Rgb24:
-                return 3;
             case PixelFormat.Gray8:
                 return 1;
-            case PixelFormat.Yuv444:
-                return 3;
             default:
-                throw new ArgumentException("The format is planar and has no single packed pixel size.", nameof(format));
+                throw new ArgumentException("Only Bgra32, Rgba32 and Gray8 support CPU image transfers.", nameof(format));
         }
     }
 
     public static void ValidateTransferFormat(PixelFormat format, string parameterName)
     {
         if (!IsTransferFormat(format))
-            throw new ArgumentException("Yuv422 and Yuv420 are only valid as GrotheImage storage formats.", parameterName);
+            throw new ArgumentException("Only Bgra32, Rgba32 and Gray8 are supported as input or output image formats.", parameterName);
     }
 }

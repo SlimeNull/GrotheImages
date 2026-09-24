@@ -7,8 +7,11 @@ using System.Text;
 
 namespace GrotheImages;
 
-public sealed class LayerCompose
+public sealed class LayerCompose : IDisposable
 {
+    private LoadProgram _loadProgram;
+    private GrotheImage _owner;
+    private bool _disposed;
     internal LayerCompose(string expression, IReadOnlyList<ExpressionNode> outputs, IReadOnlyCollection<int> referencedLayers)
     {
         Expression = expression;
@@ -22,6 +25,35 @@ public sealed class LayerCompose
 
     internal ReadOnlyCollection<ExpressionNode> Outputs { get; }
     internal ReadOnlyCollection<int> ReferencedLayerIndices { get; }
+    internal GrotheImage Owner => _disposed ? null : _owner;
+
+    internal void Attach(GrotheImage owner) => _owner = owner;
+
+    internal LoadProgram GetLoadProgram()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(LayerCompose));
+        return _loadProgram ?? (_loadProgram = new LoadProgram(_owner, this));
+    }
+
+    internal void DisposeProgram()
+    {
+        _loadProgram?.Dispose();
+        _loadProgram = null;
+        _disposed = true;
+        _owner = null;
+    }
+
+    public void Dispose()
+    {
+        GrotheImage owner = _owner;
+        if (owner == null) return;
+        lock (owner.SyncRoot)
+        {
+            if (_disposed) return;
+            DisposeProgram();
+            owner.ReleaseCompose(this);
+        }
+    }
 
     internal string ToHlsl()
     {

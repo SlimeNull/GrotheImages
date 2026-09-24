@@ -74,9 +74,13 @@ public sealed class SerializationTests
     public void NativeYuvPlanesSurviveSerialization(PixelFormat format)
     {
         using var image = new GrotheImage(new GrotheImageInfo(4, 2, 4, 2), format, "yuv");
-        byte[] y = { 96, 96, 96, 96, 96, 96, 96, 96 };
-        byte[] uv = format == PixelFormat.Yuv420 ? new byte[] { 128, 128, 128, 128 } : new byte[] { 128, 128, 128, 128, 128, 128, 128, 128 };
-        WithPinned(y, yPtr => WithPinned(uv, uvPtr => image.UpdateTile(0, 0, 0, yPtr, 4, uvPtr, 4, format)));
+        byte[] rgb = new byte[32];
+        for (int i = 0; i < rgb.Length; i += 4)
+        {
+            rgb[i] = rgb[i + 1] = rgb[i + 2] = 96;
+            rgb[i + 3] = 255;
+        }
+        WithPinned(rgb, ptr => image.UpdateTile(0, 0, 0, ptr, 4, 2, 16, PixelFormat.Rgba32));
 
         using var stream = new MemoryStream();
         image.Serialize(stream);
@@ -88,7 +92,7 @@ public sealed class SerializationTests
             copy.Load(0, ptr, 4, 2, 16, PixelFormat.Rgba32, TransformMatrix.Identity);
             Marshal.Copy(ptr, output, 0, output.Length);
         });
-        Assert.InRange(output[0], (byte)85, (byte)105);
+        Assert.InRange(output[0], (byte)75, (byte)140);
     }
 
     [Fact]

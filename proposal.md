@@ -9,7 +9,7 @@ GrotheImages 是一个面向 .NET Framework 4.6.2 的 C# 图像处理库。它�
 - 支持宽高远大于单张 Direct3D 纹理上限的图像，例如 100000 x 100000。
 - 一个 `GrotheImage` 包含任意数量、带名称的 layer。
 - 支持带透视变换的 `Update`、`Load` 和 `LayerCompose` 加载。
-- 支持 BGRA/RGBA/BGR/RGB/Gray/Yuv444 的 GPU 传输，并支持 Yuv422/Yuv420 作为 GrotheImage 的原生双平面存储格式。
+- 支持 BGRA/RGBA/Gray 的 GPU 传输；Yuv444/Yuv422/Yuv420 仅作为 GrotheImage 的原生双平面存储格式。
 - 分块之间可有重叠，重采样时从重叠区域取样，避免块边缘出现透明或黑边。
 - 所有变换和数学运算走 D3D11 计算/像素 shader；没有硬件时明确报错，不自动把核心处理降级到 CPU。
 
@@ -72,7 +72,6 @@ GrotheImages/
   Graphics/
     D3D11DeviceContext.cs
     ShaderCompiler.cs
-    ShaderCache.cs
     UploadPipeline.cs
     DownloadPipeline.cs
     WarpPipeline.cs
@@ -137,7 +136,7 @@ public enum PixelFormat
 }
 ```
 
-`PixelFormat` 同时描述外部传输格式和 `GrotheImage` 的逻辑存储格式，但两种场景的合法值不同。`GrotheImage` 构造时可以选择任意一种格式；`Update`、两个 `Load` 重载只能接收/输出 `Bgra32`、`Rgba32`、`Bgr24`、`Rgb24`、`Gray8`、`Yuv444`。如果 `Update` 或 `Load` 传入 `Yuv422`/`Yuv420`，必须立即抛出 `ArgumentException`，因为这两种格式不接受任何外部打包像素布局。
+`PixelFormat` 同时描述外部传输格式和 `GrotheImage` 的逻辑存储格式，但两种场景的合法值不同。`GrotheImage` 构造时可以选择任意一种格式；`Update`、两个 `Load` 重载和 `UpdateTile` 只接收/输出 `Bgra32`、`Rgba32`、`Gray8`。Bgr24、Rgb24 和所有 YUV 格式不作为用户图像传输格式；YUV 只表示 GrotheImage 的内部存储。
 
 图像创建时的格式决定每个 layer tile 的物理资源：
 
@@ -152,16 +151,16 @@ public enum PixelFormat
 | `Yuv422` | Y 平面 `R8_UNORM` 为 W x H；UV 平面 `R8G8_UNORM` 为 (W/2) x H | Y,U,V |
 | `Yuv420` | Y 平面 `R8_UNORM` 为 W x H；UV 平面 `R8G8_UNORM` 为 (W/2) x (H/2) | Y,U,V |
 
-Direct3D 没有 24-bit RGB/BGR typed texture，因此 `Bgr24`/`Rgb24` 用 4 通道物理资源保存三个有效通道，alpha 不对外暴露。`Yuv422`/`Yuv420` 的 Y 和交错 UV 必须是两张独立纹理，不能拼成一张 packed texture；这样双线性采样可以分别按各自分辨率进行。`Yuv444` 也使用 Y/UV 双平面，避免把 YUV 语义误当成 RGB 纹理。
+`Yuv422`/`Yuv420` 的 Y 和交错 UV 必须是两张独立纹理，不能拼成一张 packed texture；这样双线性采样可以分别按各自分辨率进行。`Yuv444` 也使用 Y/UV 双平面，避免把 YUV 语义误当成 RGB 纹理。
 
-外部传输格式的内存布局只对允许的 `Update`/`Load` 格式定义：`Bgra32` 为 B,G,R,A，`Rgba32` 为 R,G,B,A，`Bgr24` 为 B,G,R，`Rgb24` 为 R,G,B，`Gray8` 为单通道，`Yuv444` 为每像素 Y,U,V。所有这些格式使用一个 `scan0` 和逐行 `stride`；`Yuv422`/`Yuv420` 不存在外部 `scan0` 打包布局。指针、stride、整数溢出和最小缓冲区大小都在提交 GPU 前检查。
+外部传输格式的内存布局只对允许的 `Update`/`Load` 格式定义：`Bgra32` 为 B,G,R,A，`Rgba32` 为 R,G,B,A，`Gray8` 为单通道。BGR/RGB 24 位和所有 YUV 格式不存在外部 `scan0` 传输布局。指针、stride、整数溢出和最小缓冲区大小都在提交 GPU 前检查。
 
 内部通道使用归一化 float 语义，v1 不隐式执行 sRGB/gamma 转换。YUV 的 BT.709 limited 转换只发生在需要 RGB 输出或 RGB 输入写入 YUV layer 的 shader 中；表达式直接访问 YUV layer 时，`.r/.g/.b` 分别表示 Y/U/V，`.a` 为 1。
 
 ### 4.3 图像信息和 tile 网格
 
 ```csharp
-public sealed class GrotheImageInfo
+public readonly struct GrotheImageInfo
 {
     public GrotheImageInfo(
         long width,
@@ -312,21 +311,12 @@ public sealed class GrotheImage : IDisposable
         int stride,
         PixelFormat format);
 
-    public void UpdateTile(
-        int layerIndex,
-        long tileRow,
-        long tileColumn,
-        nint yScan0,
-        int yStride,
-        nint uvScan0,
-        int uvStride,
-        PixelFormat format);
 }
 ```
 
 为兼容较旧编译器，也可以在公共签名中使用 `IntPtr`，并用 `nint` 作为文档和调用方的等价写法；实现阶段应统一一种签名，不提供两套会产生歧义的重载。
 
-三个图像处理入口 `Update`、`Load(int layerIndex, ...)` 和 `Load(LayerCompose, ...)` 都必须显式传入 `PixelFormat`。`Load` 的 `format` 是输出格式；它不能是 `Yuv422` 或 `Yuv420`。`UpdateTile` 没有 `TransformMatrix`，它按 tile 行列坐标直接写入指定 tile：单指针重载用于非 YUV 双平面格式，双指针重载只用于 `Yuv422`/`Yuv420` 的 Y/UV 原生纹理数据。两种重载都要求传入的 `format` 与 `GrotheImage.Format` 一致。
+三个图像处理入口 `Update`、`Load(int layerIndex, ...)` 和 `Load(LayerCompose, ...)` 都必须显式传入 `PixelFormat`，合法值只有 `Bgra32`、`Rgba32` 和 `Gray8`。`Load` 的 `format` 是输出格式。`UpdateTile` 没有 `TransformMatrix`，按 tile 行列坐标直接写入指定 tile；输入格式可以与 GrotheImage 的内部存储格式不同，由 GPU shader 完成转换。
 
 由于 `GrotheImageInfo` 最终只保存几何字段，layer 名称和图像格式由 `GrotheImage` 传入，例如 `new GrotheImage(info, PixelFormat.Yuv420, "a", "b")`。构造函数复制并冻结 layer 名称：名称不能为空、不能重复、不能包含表达式语法中的 `.`, `,`, `(`, `)`, 运算符或空白。至少需要一个 layer。`LayerNames` 返回 `ReadOnlyCollection<string>`，因此调用方可以直接使用 `LayerNames.IndexOf(name)`；`layerIndex` 必须位于范围内。也可以增加 `GetLayerIndex(string name)` 辅助方法。
 
@@ -384,9 +374,7 @@ D3D11 对单个 `Texture2DArray` 的 slice 数量和单次绑定的 SRV 数量�
 
 `UpdateTile` 不接受 `TransformMatrix`，也不根据逻辑图像矩形规划 tile；调用方直接指定 `tileRow/tileColumn` 和该 tile 的存储尺寸。它适合从外部 tile cache、解码器或持久化后端恢复原生 tile 数据。
 
-- 单指针重载用于 `Bgra32`、`Rgba32`、`Bgr24`、`Rgb24`、`Gray8`、`Yuv444` 等可以由逐行数据描述的格式。对 Yuv444，GPU 会把 packed 的 Y,U,V 分发到 Y/UV 两张 tile 纹理；对不具备 24-bit DXGI 格式的 BGR/RGB，可以做一次 GPU 通道填充，但都不执行几何变换。
-- 双指针重载的 `yScan0/yStride` 和 `uvScan0/uvStride` 分别对应 Y、UV 纹理，只允许 `GrotheImage.Format` 为 `Yuv422` 或 `Yuv420`。UV 输入必须已经按目标平面尺寸交错为 U,V 对，不允许 YUY2、NV12 等单指针 packed buffer。
-- `format` 必须等于 `GrotheImage.Format`，宽高必须匹配统一的 `TileWidth`/`TileHeight` 存储尺寸（包括 overlap）；边缘 tile 也使用相同尺寸，逻辑边界由网格公式确定。写入前校验 row/column 不越界。
+- 单指针重载用于 `Bgra32`、`Rgba32`、`Gray8`，输入与目标存储格式不同的转换由 GPU 完成，不执行几何变换。宽高必须匹配统一的 `TileWidth`/`TileHeight` 存储尺寸（包括 overlap）；边缘 tile 也使用相同尺寸，逻辑边界由网格公式确定。
 
 该 API 仍通过 GPU upload/copy 写入 tile 资源；“直接”指直接定位 tile、不做透视和全图坐标变换，不代表允许 CPU 逐像素写入 GPU 纹理。
 
@@ -398,7 +386,7 @@ D3D11 对单个 `Texture2DArray` 的 slice 数量和单次绑定的 SRV 数量�
 2. 创建匹配输出尺寸和输出格式的 GPU render target；`scan0` 只作为最后的 readback 目标，不直接作为像素着色器 render target。
 3. 按输出矩形和逆矩阵计算可能被访问的源逻辑区域，加载该区域需要的全部 tile，建立 `TileArrayBinding`，并把所有参与本次 pass 的 tile array/page、tile 网格参数和矩阵常量绑定到像素着色器。
 4. 对输出的每个像素执行 `LoadTilePS`。像素着色器先用逆矩阵把输出像素中心反算到源坐标，再按采样归属中线计算 tile 行列、array page/slice 和 tile 局部坐标，最后调用线性 sampler 从对应 `Texture2DArray` slice 采样。它不按 tile 分别 dispatch。
-5. 对 Yuv422/Yuv420 源 tile，像素着色器同时从 Y array 和 UV array 采样；然后按请求的 RGB、Gray 或 Yuv444 输出格式编码。`LayerCompose` 版本在同一个像素着色器中对采样出的逻辑通道执行编译后的 AST。
+5. 对 Yuv422/Yuv420 源 tile，像素着色器同时从 Y array 和 UV array 采样，然后按请求的 BGRA、RGBA 或 Gray 输出格式编码。`LayerCompose` 版本在同一个像素着色器中对采样出的逻辑通道执行编译后的 AST。
 6. GPU 完成 render target 和格式转换后复制到 staging texture，再把 staging 数据复制到调用方的 `scan0`。API 默认同步返回，内部可预留 command fence 以便以后增加异步版本。
 
 像素着色器的核心坐标计算等价于：
@@ -433,7 +421,7 @@ public sealed class LayerCompose
 
 `CreateLayerCompose` 在创建时完成词法分析、语法分析、layer 名称绑定、通道检查和 HLSL 编译。返回对象是不可变的，可被多个 `Load` 调用复用。表达式非法时立即抛出包含字符位置的 `FormatException` 或 `ArgumentException`，而不是等到 GPU 执行时失败。
 
-所有 layer 属于同一个 `GrotheImage`，因此共享同一个存储格式。表达式读取的是图像格式的逻辑通道：RGB/BGR 是 R/G/B/A，Gray8 的 Gray 会复制到 R/G/B，YUV 是 Y/U/V/A。编译器为每种存储格式生成对应的采样 accessor；YUV accessor 同时绑定 Y 和 UV SRV。输出 `format` 仍必须是允许的传输格式，`Yuv422`/`Yuv420` 直接异常；当源逻辑域和输出格式不同（例如 RGB layer 输出 `Yuv444`，或 YUV layer 输出 RGB）时，在 compose shader 的最后一步做 GPU 色彩转换。
+所有 layer 属于同一个 `GrotheImage`，因此共享同一个存储格式。表达式读取的是图像格式的逻辑通道：RGB 是 R/G/B/A，Gray8 直接使用采样器返回的通道结果，YUV 是 Y/U/V/A。编译器为每种存储格式生成对应的采样 accessor；YUV accessor 同时绑定 Y 和 UV SRV。输出 `format` 只能是 `Bgra32`、`Rgba32` 或 `Gray8`，其他格式直接异常。
 
 ### 7.2 第一版语法
 
@@ -454,7 +442,7 @@ swizzle       := 'r' | 'g' | 'b' | 'a' | 'rg' | 'gb' | 'rgb' | 'rgba'
 - 标量与向量运算按标量广播；相同维度向量逐分量运算。
 - 两个不同维度的向量不隐式扩展，避免 `rgb + gb` 产生不明确结果。
 - 乘法和除法是逐分量运算，不支持矩阵乘法或 dot product。
-- 逗号分隔的结果会把每个标量/向量结果按顺序展开，因此 `a.r, b.gb` 是 3 个输出通道。总通道数量必须能映射到目标 `PixelFormat`：Gray8 为 1，RGB/BGR/Yuv444 为 3，RGBA/BGRA 为 4。Yuv422/Yuv420 不能作为 compose 输出。Yuv444 输出使用 Y/U/V 三个通道；RGB 与 YUV 域之间的转换由输出 shader 负责。
+- 逗号分隔的结果会把每个标量/向量结果按顺序展开，因此 `a.r, b.gb` 是 3 个输出通道。总通道数量必须能映射到目标 `PixelFormat`：Gray8 为 1，BGRA/RGBA 为 4。YUV 和 24 位格式不能作为 compose 输出；RGB 与 YUV 存储域之间的转换由输出 shader 负责。
 - 常量为 float；表达式结果在 `[0,1]` 外不截断，输出 shader 的最后一步才 clamp。
 
 示例：
@@ -469,7 +457,7 @@ a.gb - b.gb
 
 ### 7.3 HLSL 生成和缓存
 
-AST 经类型检查后生成 HLSL 函数。每个 layer 引用编译成对该 layer `Texture2DArray`/YUV 双 array 的采样 accessor，矩阵逆变换、采样归属 tile 计算和 page/slice 选择由 Load render pass 统一完成。表达式文本、绑定 layer 顺序、输出通道数、shader profile 和库版本组成缓存 key；缓存内容包括 AST、HLSL 源码、编译后的 `ID3DBlob` 和输入布局描述。
+AST 经类型检查后生成 HLSL 函数。每个 layer 引用编译成对该 layer `Texture2DArray`/YUV 双 array 的采样 accessor，矩阵逆变换、采样归属 tile 计算和 page/slice 选择由 Load render pass 统一完成。普通 Load program 存在 GrotheImage 中，Compose Load program 存在 LayerCompose 中；同一实例重复 Load 时复用已经创建的 shader、sampler 和 constant buffer。`UpdateProgram` 也按 GrotheImage 保存一个实例，第一次 Execute 时延迟创建目标存储格式对应的 shader，之后在 Bgra32、Rgba32、Gray8 输入之间复用。
 
 生产模式下优先使用离线 shader 编译产物，开发模式允许调用 `D3DCompile` 并记录源码。编译错误转换为 `GrotheImageException`，其中包含原表达式、生成的 HLSL 和编译器行号，方便定位。
 
@@ -495,7 +483,7 @@ AST 经类型检查后生成 HLSL 函数。每个 layer 引用编译成对该 la
 - null/无效指针、stride 太小、宽高非正数或缓冲区大小溢出。
 - layer index 越界、layer 名称重复或表达式引用未知 layer。
 - 变换矩阵含 NaN/Infinity、不可逆或透视除数可能无效。
-- `Update`/`Load` 使用 `Yuv422`/`Yuv420`，或 `UpdateTile` 的 `format` 与 `GrotheImage.Format` 不一致。
+- `Update`/`Load` 使用 YUV 或 24 位格式。
 - Yuv422/Yuv420 的逻辑尺寸、tile 尺寸、overlap、Y/UV 平面尺寸、平面 stride 或 UV 交错约束不满足；这些格式按 2 倍子采样要求相关宽高和坐标偶数对齐。
 - tile overlap 不小于 tile 尺寸、逻辑尺寸超出 `long` 或单 tile 超出设备限制。
 - adapter 不支持所需 D3D11 feature、shader model 或 typed UAV。
@@ -539,7 +527,7 @@ GPU 集成测试覆盖：
 ## 12. 需要在实现前确认的决策
 
 - 第一版是否接受只支持 D3D11、Windows x64，以及无硬件时直接失败。
-- 是否接受 `Yuv444` 使用单指针 packed Y,U,V 传输，而 `Yuv422`/`Yuv420` 只通过 `UpdateTile` 的 Y/UV 双平面接口访问；Update/Load 不定义 YUY2、NV12 等 packed 输入输出。
+- YUV 是否只作为 GrotheImage 创建时的内部存储格式；当前 Update、Load 和 UpdateTile 均不接受 YUV 用户缓冲区，UpdateTile 也不再提供 Y/UV 双指针重载。
 - 后续是否增加可配置的线性/sRGB/gamma 转换；v1 固定使用归一化数值空间。
 - `Load` 的输出 alpha 是否允许表达式指定，还是所有无 alpha 输出固定为 1。
 - 同一重叠区域被多次 `Update` 写入时是否采用最后提交者覆盖，或需要额外的 blend 策略。

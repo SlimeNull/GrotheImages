@@ -6,6 +6,16 @@ namespace GrotheImages.Tests;
 public sealed class GrotheImageInfoTests
 {
     [Fact]
+    public void ImageInfoIsAValueTypeWithIndependentCopies()
+    {
+        Assert.True(typeof(GrotheImageInfo).IsValueType);
+        var info = GrotheImageInfo.FromTiles(100, 100, 2, 3, 10, 10);
+        GrotheImageInfo copy = info;
+        Assert.Equal(info.TileWidth, copy.TileWidth);
+        Assert.Equal(info.Width, copy.Width);
+    }
+
+    [Fact]
     public void EqualSizeTilesUseStepAndOverlapFormula()
     {
         var info = GrotheImageInfo.FromTiles(100, 100, 2, 3, 10, 10);

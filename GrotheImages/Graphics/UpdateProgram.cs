@@ -1,8 +1,7 @@
 using System;
-using System.Runtime.InteropServices;
 using System.Text;
-using Vortice.Direct3D11;
 using Vortice.Direct3D;
+using Vortice.Direct3D11;
 using Vortice.Mathematics;
 using DxgiFormat = Vortice.DXGI.Format;
 
@@ -10,272 +9,153 @@ namespace GrotheImages;
 
 internal sealed class UpdateProgram : IDisposable
 {
-    private readonly GrotheImage _image;
-    private readonly PixelFormat _sourceFormat;
-    private readonly PixelFormat _targetFormat;
-    private readonly ID3D11ComputeShader _shader;
-    private readonly ID3D11SamplerState _sampler;
-    private readonly ID3D11Buffer _constants;
-    private readonly ID3D11ShaderResourceView _sourceView;
-    private readonly ID3D11ShaderResourceView _sourceUvView;
-    private readonly ID3D11Resource _sourceResource;
-    private readonly ID3D11Resource _sourceUvResource;
-    private readonly byte[] _sourceBytes;
-    private readonly GCHandle _sourceHandle;
-    private readonly int _sourceRowPitch;
+    private ID3D11ComputeShader _shader;
+    private ID3D11SamplerState _sampler;
+    private ID3D11Buffer _constants;
 
-    public UpdateProgram(GrotheImage image, nint source, int width, int height, int stride, PixelFormat sourceFormat, TransformMatrix transform)
+    private GrotheImage _image;
+    private PixelFormat _targetFormat;
+
+    public UpdateProgram()
+    {
+        _shader = null;
+        _sampler = null;
+        _constants = null;
+    }
+
+    public void Execute(GrotheImage image, int layerIndex, nint source, int width, int height, int stride, PixelFormat sourceFormat, TransformMatrix transform)
     {
         _image = image;
-        _sourceFormat = sourceFormat;
-        _targetFormat = image.Format;
-        _sourceBytes = PrepareSource(source, width, height, stride, sourceFormat, out DxgiFormat dxgiFormat, out _sourceRowPitch);
-        _sourceHandle = GCHandle.Alloc(_sourceBytes, GCHandleType.Pinned);
-        _sourceResource = image.Graphics.Device.CreateTexture2D(
-            dxgiFormat, width, height, 1, 1, null,
-            BindFlags.ShaderResource,
-            ResourceOptionFlags.None,
-            ResourceUsage.Default,
-            CpuAccessFlags.None);
-        image.Graphics.Context.UpdateSubresource(_sourceResource, 0, null, _sourceHandle.AddrOfPinnedObject(), _sourceRowPitch, 0);
-        _sourceView = image.Graphics.Device.CreateShaderResourceView(_sourceResource, null);
-        _sourceUvView = null;
-        _sourceUvResource = null;
-
-        string shaderSource = BuildShaderSource(sourceFormat, image.Format);
-        using (var blob = ShaderCompiler.Compile(shaderSource, "CSMain", "cs_5_0"))
-            _shader = image.Graphics.Device.CreateComputeShader(blob, null);
-        _sampler = image.Graphics.Device.CreateSamplerState(new SamplerDescription(
-            Filter.MinMagMipLinear,
-            TextureAddressMode.Clamp,
-            TextureAddressMode.Clamp,
-            TextureAddressMode.Clamp,
-            0,
-            1,
-            ComparisonFunction.Never,
-            0,
-            float.MaxValue));
-        _constants = image.Graphics.Device.CreateBuffer(
-            new float[24],
-            BindFlags.ConstantBuffer,
-            ResourceUsage.Default,
-            CpuAccessFlags.None,
-            ResourceOptionFlags.None,
-            0,
-            0);
+        EnsureResources();
+        using (ID3D11Texture2D texture = CreateSource(source, width, height, stride, sourceFormat))
+        using (ID3D11ShaderResourceView view = _image.Graphics.Device.CreateShaderResourceView(texture, null))
+        {
+            LayerStore store = _image.GetLayer(layerIndex);
+            double minX = double.PositiveInfinity, minY = double.PositiveInfinity;
+            double maxX = double.NegativeInfinity, maxY = double.NegativeInfinity;
+            foreach (var point in new[]
+            {
+                transform.TransformPoint(0, 0), transform.TransformPoint(width, 0),
+                transform.TransformPoint(0, height), transform.TransformPoint(width, height)
+            })
+            {
+                minX = Math.Min(minX, point.X); minY = Math.Min(minY, point.Y);
+                maxX = Math.Max(maxX, point.X); maxY = Math.Max(maxY, point.Y);
+            }
+            GrotheImageInfo info = _image.Info;
+            long firstColumn = TileGrid.Clamp((long)Math.Floor(minX / info.StepX) - 1, 0, info.TileColumns - 1);
+            long lastColumn = TileGrid.Clamp((long)Math.Floor(maxX / info.StepX) + 1, 0, info.TileColumns - 1);
+            long firstRow = TileGrid.Clamp((long)Math.Floor(minY / info.StepY) - 1, 0, info.TileRows - 1);
+            long lastRow = TileGrid.Clamp((long)Math.Floor(maxY / info.StepY) + 1, 0, info.TileRows - 1);
+            for (long row = firstRow; row <= lastRow; row++)
+            for (long column = firstColumn; column <= lastColumn; column++)
+                DispatchTile(store, view, row, column, width, height, transform);
+            _image.Graphics.Context.Flush();
+        }
     }
 
-    public UpdateProgram(GrotheImage image, nint ySource, int yStride, nint uvSource, int uvStride, int width, int height, PixelFormat sourceFormat)
+    public void ExecuteTile(GrotheImage image, int layerIndex, long row, long column, nint source, int width, int height, int stride, PixelFormat sourceFormat)
     {
-        if (sourceFormat != PixelFormat.Yuv422 && sourceFormat != PixelFormat.Yuv420)
-            throw new ArgumentException("The planar UpdateTile source must be Yuv422 or Yuv420.", nameof(sourceFormat));
         _image = image;
-        _sourceFormat = sourceFormat;
-        _targetFormat = image.Format;
-        _sourceBytes = null;
-        _sourceHandle = default(GCHandle);
-        _sourceRowPitch = yStride;
-        _sourceResource = image.Graphics.Device.CreateTexture2D(
-            DxgiFormat.R8_UNorm, width, height, 1, 1, null,
-            BindFlags.ShaderResource,
-            ResourceOptionFlags.None,
-            ResourceUsage.Default,
-            CpuAccessFlags.None);
-        image.Graphics.Context.UpdateSubresource(_sourceResource, 0, null, ySource, yStride, 0);
-        _sourceView = image.Graphics.Device.CreateShaderResourceView(_sourceResource, null);
-
-        int uvHeight = sourceFormat == PixelFormat.Yuv420 ? height / 2 : height;
-        _sourceUvResource = image.Graphics.Device.CreateTexture2D(
-            DxgiFormat.R8G8_UNorm, width / 2, uvHeight, 1, 1, null,
-            BindFlags.ShaderResource,
-            ResourceOptionFlags.None,
-            ResourceUsage.Default,
-            CpuAccessFlags.None);
-        image.Graphics.Context.UpdateSubresource(_sourceUvResource, 0, null, uvSource, uvStride, 0);
-        _sourceUvView = image.Graphics.Device.CreateShaderResourceView(_sourceUvResource, null);
-
-        string shaderSource = BuildShaderSource(sourceFormat, image.Format);
-        using (var blob = ShaderCompiler.Compile(shaderSource, "CSMain", "cs_5_0"))
-            _shader = image.Graphics.Device.CreateComputeShader(blob, null);
-        _sampler = image.Graphics.Device.CreateSamplerState(new SamplerDescription(
-            Filter.MinMagMipLinear,
-            TextureAddressMode.Clamp,
-            TextureAddressMode.Clamp,
-            TextureAddressMode.Clamp,
-            0,
-            1,
-            ComparisonFunction.Never,
-            0,
-            float.MaxValue));
-        _constants = image.Graphics.Device.CreateBuffer(
-            new float[24],
-            BindFlags.ConstantBuffer,
-            ResourceUsage.Default,
-            CpuAccessFlags.None,
-            ResourceOptionFlags.None,
-            0,
-            0);
+        EnsureResources();
+        using (ID3D11Texture2D texture = CreateSource(source, width, height, stride, sourceFormat))
+        using (ID3D11ShaderResourceView view = _image.Graphics.Device.CreateShaderResourceView(texture, null))
+        {
+            var transform = new TransformMatrix(
+                1, 0, -column * (double)_image.Info.StepX,
+                0, 1, -row * (double)_image.Info.StepY, 0, 0, 1);
+            DispatchTile(_image.GetLayer(layerIndex), view, row, column, width, height, transform);
+            _image.Graphics.Context.Flush();
+        }
     }
 
-    public void Execute(int layerIndex, TransformMatrix transform, int sourceWidth, int sourceHeight)
+    private ID3D11Texture2D CreateSource(nint source, int width, int height, int stride, PixelFormat sourceFormat)
     {
-        LayerStore store = _image.GetLayer(layerIndex);
-        double minX = double.PositiveInfinity;
-        double minY = double.PositiveInfinity;
-        double maxX = double.NegativeInfinity;
-        double maxY = double.NegativeInfinity;
-        foreach (var point in new[]
+        DxgiFormat format = sourceFormat == PixelFormat.Gray8 ? DxgiFormat.R8_UNorm
+            : sourceFormat == PixelFormat.Bgra32 ? DxgiFormat.B8G8R8A8_UNorm : DxgiFormat.R8G8B8A8_UNorm;
+        ID3D11Texture2D texture = _image.Graphics.Device.CreateTexture2D(
+            format, width, height, 1, 1, null, BindFlags.ShaderResource,
+            ResourceOptionFlags.None, ResourceUsage.Default, CpuAccessFlags.None);
+        try
         {
-            transform.TransformPoint(0, 0),
-            transform.TransformPoint(sourceWidth, 0),
-            transform.TransformPoint(0, sourceHeight),
-            transform.TransformPoint(sourceWidth, sourceHeight),
-        })
-        {
-            minX = Math.Min(minX, point.X);
-            minY = Math.Min(minY, point.Y);
-            maxX = Math.Max(maxX, point.X);
-            maxY = Math.Max(maxY, point.Y);
+            _image.Graphics.Context.UpdateSubresource(texture, 0, null, source, stride, 0);
+            return texture;
         }
-        long firstColumn = TileGrid.Clamp((long)Math.Floor(minX / _image.Info.StepX) - 1, 0, _image.Info.TileColumns - 1);
-        long lastColumn = TileGrid.Clamp((long)Math.Floor(maxX / _image.Info.StepX) + 1, 0, _image.Info.TileColumns - 1);
-        long firstRow = TileGrid.Clamp((long)Math.Floor(minY / _image.Info.StepY) - 1, 0, _image.Info.TileRows - 1);
-        long lastRow = TileGrid.Clamp((long)Math.Floor(maxY / _image.Info.StepY) + 1, 0, _image.Info.TileRows - 1);
-        for (long row = firstRow; row <= lastRow; row++)
-        for (long column = firstColumn; column <= lastColumn; column++)
+        catch
         {
-            TileArrayPage page = store.GetPageForTile(row, column, out int slice);
-            float[] values = CreateConstants(transform, sourceWidth, sourceHeight, row, column, slice);
-            _image.Graphics.Context.UpdateSubresource(values, _constants, 0, 0, 0, null);
-            _image.Graphics.Context.CSSetShader(_shader);
-            var sourceViews = _sourceUvView == null
-                ? new[] { _sourceView }
-                : new[] { _sourceView, _sourceUvView };
-            _image.Graphics.Context.CSSetShaderResources(0, sourceViews);
-            _image.Graphics.Context.CSSetSamplers(0, new[] { _sampler });
-            _image.Graphics.Context.CSSetConstantBuffers(0, new[] { _constants });
-            if (_targetFormat == PixelFormat.Yuv444 || _targetFormat == PixelFormat.Yuv422 || _targetFormat == PixelFormat.Yuv420)
-                _image.Graphics.Context.CSSetUnorderedAccessViews(0, new[] { page.Y.UnorderedAccessView, page.Uv.UnorderedAccessView });
-            else
-                _image.Graphics.Context.CSSetUnorderedAccessViews(0, new[] { page.Color.UnorderedAccessView });
-            _image.Graphics.Context.Dispatch((_image.Info.TileWidth + 7) / 8, (_image.Info.TileHeight + 7) / 8, 1);
-            store.MarkWritten(row, column);
-            _image.Graphics.Context.CSSetUnorderedAccessViews(0, new ID3D11UnorderedAccessView[] { null, null });
-            _image.Graphics.Context.CSSetShaderResources(0, new ID3D11ShaderResourceView[sourceViews.Length]);
+            texture.Dispose();
+            throw;
         }
-        _image.Graphics.Context.Flush();
     }
 
-    public void ExecuteTile(int layerIndex, long tileRow, long tileColumn)
+    private void EnsureResources()
     {
-        LayerStore store = _image.GetLayer(layerIndex);
-        TileArrayPage page = store.GetPageForTile(tileRow, tileColumn, out int slice);
-        var transform = new TransformMatrix(
-            1, 0, -tileColumn * (double)_image.Info.StepX,
-            0, 1, -tileRow * (double)_image.Info.StepY,
-            0, 0, 1);
-        float[] values = CreateConstants(transform, _image.Info.TileWidth, _image.Info.TileHeight, tileRow, tileColumn, slice);
-        _image.Graphics.Context.UpdateSubresource(values, _constants, 0, 0, 0, null);
-        _image.Graphics.Context.CSSetShader(_shader);
-        var sourceViews = _sourceUvView == null
-            ? new[] { _sourceView }
-            : new[] { _sourceView, _sourceUvView };
-        _image.Graphics.Context.CSSetShaderResources(0, sourceViews);
-        _image.Graphics.Context.CSSetSamplers(0, new[] { _sampler });
-        _image.Graphics.Context.CSSetConstantBuffers(0, new[] { _constants });
-        if (_targetFormat == PixelFormat.Yuv444 || _targetFormat == PixelFormat.Yuv422 || _targetFormat == PixelFormat.Yuv420)
-            _image.Graphics.Context.CSSetUnorderedAccessViews(0, new[] { page.Y.UnorderedAccessView, page.Uv.UnorderedAccessView });
+        if (_shader != null) return;
+        _targetFormat = _image.Format;
+        using (var blob = ShaderCompiler.Compile(BuildShaderSource(_targetFormat), "CSMain", "cs_5_0"))
+            _shader = _image.Graphics.Device.CreateComputeShader(blob, null);
+        _sampler = _image.Graphics.Device.CreateSamplerState(new SamplerDescription(
+            Filter.MinMagMipLinear, TextureAddressMode.Clamp, TextureAddressMode.Clamp,
+            TextureAddressMode.Clamp, 0, 1, ComparisonFunction.Never, 0, float.MaxValue));
+        _constants = _image.Graphics.Device.CreateBuffer(
+            new float[24], BindFlags.ConstantBuffer, ResourceUsage.Default,
+            CpuAccessFlags.None, ResourceOptionFlags.None, 0, 0);
+    }
+
+    private void DispatchTile(LayerStore store, ID3D11ShaderResourceView view, long row, long column,
+        int sourceWidth, int sourceHeight, TransformMatrix transform)
+    {
+        TileArrayPage page = store.GetPageForTile(row, column, out int slice);
+        GrotheImageInfo info = _image.Info;
+        float[] values =
+        {
+            (float)transform.M00, (float)transform.M01, (float)transform.M02, 0,
+            (float)transform.M10, (float)transform.M11, (float)transform.M12, 0,
+            (float)transform.M20, (float)transform.M21, (float)transform.M22, 0,
+            (float)info.StepX, (float)info.StepY, info.TileColumns, info.TileRows,
+            info.TileWidth, info.TileHeight, column * (float)info.StepX, row * (float)info.StepY,
+            sourceWidth, sourceHeight, slice,
+            _image.Format == PixelFormat.Yuv420 ? 2f : _image.Format == PixelFormat.Yuv422 ? 1f : 0f
+        };
+        var context = _image.Graphics.Context;
+        context.UpdateSubresource(values, _constants, 0, 0, 0, null);
+        context.CSSetShader(_shader);
+        context.CSSetShaderResources(0, new[] { view });
+        context.CSSetSamplers(0, new[] { _sampler });
+        context.CSSetConstantBuffers(0, new[] { _constants });
+        if (page.Color != null)
+            context.CSSetUnorderedAccessViews(0, new[] { page.Color.UnorderedAccessView });
         else
-            _image.Graphics.Context.CSSetUnorderedAccessViews(0, new[] { page.Color.UnorderedAccessView });
-        _image.Graphics.Context.Dispatch((_image.Info.TileWidth + 7) / 8, (_image.Info.TileHeight + 7) / 8, 1);
-        _image.Graphics.Context.CSSetUnorderedAccessViews(0, new ID3D11UnorderedAccessView[] { null, null });
-        _image.Graphics.Context.CSSetShaderResources(0, new ID3D11ShaderResourceView[sourceViews.Length]);
-        _image.Graphics.Context.Flush();
-        store.MarkWritten(tileRow, tileColumn);
+            context.CSSetUnorderedAccessViews(0, new[] { page.Y.UnorderedAccessView, page.Uv.UnorderedAccessView });
+        try
+        {
+            context.Dispatch((info.TileWidth + 7) / 8, (info.TileHeight + 7) / 8, 1);
+            store.MarkWritten(row, column);
+        }
+        finally
+        {
+            context.CSSetUnorderedAccessViews(0, new ID3D11UnorderedAccessView[] { null, null });
+            context.CSSetShaderResources(0, new ID3D11ShaderResourceView[] { null });
+        }
     }
 
     public void Dispose()
     {
-        _constants.Dispose();
-        _sampler.Dispose();
-        _shader.Dispose();
-        _sourceView.Dispose();
-        _sourceUvView?.Dispose();
-        _sourceResource.Dispose();
-        _sourceUvResource?.Dispose();
-        if (_sourceHandle.IsAllocated) _sourceHandle.Free();
+        _constants?.Dispose();
+        _sampler?.Dispose();
+        _shader?.Dispose();
+        _constants = null;
+        _sampler = null;
+        _shader = null;
+        _image = null;
     }
 
-    private float[] CreateConstants(TransformMatrix transform, int sourceWidth, int sourceHeight, long row, long column, int slice)
+    private static string BuildShaderSource(PixelFormat targetFormat)
     {
-        return new[]
-        {
-            (float)transform.M00, (float)transform.M01, (float)transform.M02, 0f,
-            (float)transform.M10, (float)transform.M11, (float)transform.M12, 0f,
-            (float)transform.M20, (float)transform.M21, (float)transform.M22, 0f,
-            (float)_image.Info.StepX, (float)_image.Info.StepY, _image.Info.TileColumns, _image.Info.TileRows,
-            (float)_image.Info.TileWidth, (float)_image.Info.TileHeight, column * (float)_image.Info.StepX, row * (float)_image.Info.StepY,
-            sourceWidth, sourceHeight, slice, _targetFormat == PixelFormat.Yuv420 ? 2f : (_targetFormat == PixelFormat.Yuv422 ? 1f : 0f),
-        };
-    }
-
-    private static byte[] PrepareSource(nint source, int width, int height, int stride, PixelFormat format, out DxgiFormat dxgiFormat, out int rowPitch)
-    {
-        bool gray = format == PixelFormat.Gray8;
-        dxgiFormat = gray ? DxgiFormat.R8_UNorm : (format == PixelFormat.Bgra32 ? DxgiFormat.B8G8R8A8_UNorm : DxgiFormat.R8G8B8A8_UNorm);
-        rowPitch = gray ? width : width * 4;
-        byte[] result = new byte[checked(rowPitch * height)];
-        byte[] row = new byte[checked(width * PixelFormatRules.BytesPerPixel(format))];
-        for (int y = 0; y < height; y++)
-        {
-            Marshal.Copy(source + y * stride, row, 0, row.Length);
-            for (int x = 0; x < width; x++)
-            {
-                if (gray)
-                {
-                    result[y * rowPitch + x] = row[x];
-                    continue;
-                }
-                int si = x * PixelFormatRules.BytesPerPixel(format);
-                int di = y * rowPitch + x * 4;
-                if (format == PixelFormat.Yuv444)
-                {
-                    result[di] = row[si]; result[di + 1] = row[si + 1]; result[di + 2] = row[si + 2];
-                }
-                else if (format == PixelFormat.Bgr24)
-                {
-                    result[di] = row[si + 2]; result[di + 1] = row[si + 1]; result[di + 2] = row[si];
-                }
-                else if (format == PixelFormat.Rgb24)
-                {
-                    result[di] = row[si]; result[di + 1] = row[si + 1]; result[di + 2] = row[si + 2];
-                }
-                else
-                {
-                    result[di] = row[si]; result[di + 1] = row[si + 1]; result[di + 2] = row[si + 2]; result[di + 3] = row[si + 3];
-                }
-                if (format != PixelFormat.Bgra32 && format != PixelFormat.Rgba32) result[di + 3] = 255;
-            }
-        }
-        return result;
-    }
-
-    private static string BuildShaderSource(PixelFormat sourceFormat, PixelFormat targetFormat)
-    {
-        bool sourceGray = sourceFormat == PixelFormat.Gray8;
-        bool sourcePackedYuv = sourceFormat == PixelFormat.Yuv444;
-        bool sourcePlanarYuv = sourceFormat == PixelFormat.Yuv422 || sourceFormat == PixelFormat.Yuv420;
-        bool sourceYuv = sourcePackedYuv || sourcePlanarYuv;
         bool targetYuv = targetFormat == PixelFormat.Yuv444 || targetFormat == PixelFormat.Yuv422 || targetFormat == PixelFormat.Yuv420;
         bool targetGray = targetFormat == PixelFormat.Gray8;
         var b = new StringBuilder();
-        if (sourcePlanarYuv)
-        {
-            b.AppendLine("Texture2D<float> YSource : register(t0);");
-            b.AppendLine("Texture2D<float2> UvSource : register(t1);");
-        }
-        else
-            b.AppendLine(sourceGray ? "Texture2D<float> Source : register(t0);" : "Texture2D<float4> Source : register(t0);");
+        b.AppendLine("Texture2D<float4> Source : register(t0);");
         b.AppendLine("SamplerState LinearSampler : register(s0);");
         if (targetYuv)
             b.AppendLine("RWTexture2DArray<float> YTarget : register(u0); RWTexture2DArray<float2> UvTarget : register(u1);");
@@ -284,21 +164,13 @@ internal sealed class UpdateProgram : IDisposable
         else
             b.AppendLine("RWTexture2DArray<float4> Target : register(u0);");
         b.AppendLine("cbuffer Params : register(b0) { float4 M0; float4 M1; float4 M2; float4 Grid; float4 Tile; float4 SourceSize; };");
-        b.AppendLine("float4 ReadSource(float2 uv) {");
-        if (sourceGray) b.AppendLine("float v = Source.SampleLevel(LinearSampler, uv, 0); return float4(v,v,v,1);");
-        else if (sourcePlanarYuv) b.AppendLine("float y = YSource.SampleLevel(LinearSampler, uv, 0); float2 uvv = UvSource.SampleLevel(LinearSampler, uv, 0); return float4(y, uvv, 1);");
-        else if (sourcePackedYuv) b.AppendLine("float4 v = Source.SampleLevel(LinearSampler, uv, 0); return float4(v.xyz, 1);");
-        else b.AppendLine("return Source.SampleLevel(LinearSampler, uv, 0);");
-        b.AppendLine("}");
         if (targetYuv)
             b.AppendLine("float3 ToYuv(float3 rgb) { float y=dot(rgb,float3(0.2126,0.7152,0.0722)); return float3(y, (rgb.b-y)*0.5389+0.5, (rgb.r-y)*0.6350+0.5); }");
         b.AppendLine("[numthreads(8,8,1)] void CSMain(uint3 id : SV_DispatchThreadID) {");
-        b.AppendLine("if (id.x >= Tile.x || id.y >= Tile.y) return; float2 global=float2(Tile.z+id.x+0.5, Tile.w+id.y+0.5); float3 q=float3(dot(M0.xyz,float3(global,1)),dot(M1.xyz,float3(global,1)),dot(M2.xyz,float3(global,1))); float2 source=q.xy/q.z; if(source.x<0||source.y<0||source.x>=SourceSize.x||source.y>=SourceSize.y)return; float4 value=ReadSource(source/SourceSize.xy);");
-        if (sourceYuv && !targetYuv)
-            b.AppendLine("float yy=(value.x-0.0625)*1.1643836; float uu=value.y-0.5; float vv=value.z-0.5; value=float4(yy+1.7927415*vv, yy-0.2132486*uu-0.5329093*vv, yy+2.1124018*uu, 1);");
+        b.AppendLine("if (id.x >= Tile.x || id.y >= Tile.y) return; float2 global=float2(Tile.z+id.x+0.5, Tile.w+id.y+0.5); float3 q=float3(dot(M0.xyz,float3(global,1)),dot(M1.xyz,float3(global,1)),dot(M2.xyz,float3(global,1))); float2 source=q.xy/q.z; if(source.x<0||source.y<0||source.x>=SourceSize.x||source.y>=SourceSize.y)return; float4 value=Source.SampleLevel(LinearSampler, source/SourceSize.xy, 0);");
         if (targetYuv)
         {
-            b.AppendLine(sourceYuv ? "float3 yuv=value.rgb;" : "float3 yuv=ToYuv(value.rgb);");
+            b.AppendLine("float3 yuv=ToYuv(value.rgb);");
             b.AppendLine("YTarget[uint3(id.xy, (uint)SourceSize.z)] = yuv.x;");
             b.AppendLine("if ((SourceSize.w < 0.5 || (id.x & 1)==0) && (SourceSize.w < 1.5 || (id.y & 1)==0)) UvTarget[uint3(SourceSize.w < 0.5 ? id.x : id.x/2, SourceSize.w < 1.5 ? id.y : id.y/2, (uint)SourceSize.z)] = yuv.yz;");
         }

@@ -11,9 +11,6 @@ public sealed class GpuIntegrationTests
     [InlineData(PixelFormat.Gray8, 1)]
     [InlineData(PixelFormat.Bgra32, 4)]
     [InlineData(PixelFormat.Rgba32, 4)]
-    [InlineData(PixelFormat.Bgr24, 3)]
-    [InlineData(PixelFormat.Rgb24, 3)]
-    [InlineData(PixelFormat.Yuv444, 3)]
     public void TransferFormatsRoundTripThroughGpuUpdateAndLoad(PixelFormat format, int bytesPerPixel)
     {
         const int width = 2;
@@ -193,35 +190,6 @@ public sealed class GpuIntegrationTests
     }
 
     [Fact]
-    public void UpdateTileCanWriteNativeYuv422Planes()
-    {
-        byte[] y = { 90, 90, 90, 90, 90, 90, 90, 90 };
-        byte[] uv = { 128, 128, 128, 128 };
-        byte[] output = new byte[8 * 4];
-        IntPtr yPtr = Marshal.AllocHGlobal(y.Length);
-        IntPtr uvPtr = Marshal.AllocHGlobal(uv.Length);
-        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
-        try
-        {
-            Marshal.Copy(y, 0, yPtr, y.Length);
-            Marshal.Copy(uv, 0, uvPtr, uv.Length);
-            using var image = CreateGpuImage(PixelFormat.Yuv422, 4, 2);
-            image.UpdateTile(0, 0, 0, yPtr, 4, uvPtr, 4, PixelFormat.Yuv422);
-            image.Load(0, outputPtr, 4, 2, 16, PixelFormat.Rgba32, TransformMatrix.Identity);
-            Marshal.Copy(outputPtr, output, 0, output.Length);
-            Assert.InRange(output[0], (byte)80, (byte)105);
-            Assert.InRange(output[1], (byte)80, (byte)105);
-            Assert.InRange(output[2], (byte)80, (byte)105);
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(yPtr);
-            Marshal.FreeHGlobal(uvPtr);
-            Marshal.FreeHGlobal(outputPtr);
-        }
-    }
-
-    [Fact]
     public void PackedTileFormatConversionUsesGpuForYuv420Storage()
     {
         const int width = 4;
@@ -256,59 +224,68 @@ public sealed class GpuIntegrationTests
     }
 
     [Fact]
-    public void PlanarTileFormatConversionUsesGpuForPackedStorage()
+    public void UpdateProgramIsReusedAcrossInputFormatsAndOperations()
     {
-        const int width = 4;
-        const int height = 2;
-        byte[] y = { 90, 90, 90, 90, 90, 90, 90, 90 };
-        byte[] uv = { 128, 128, 128, 128 };
-        byte[] output = new byte[width * height * 4];
-        IntPtr yPtr = Marshal.AllocHGlobal(y.Length);
-        IntPtr uvPtr = Marshal.AllocHGlobal(uv.Length);
-        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
+        using var image = CreateGpuImage(PixelFormat.Rgba32, 1, 1);
+        IntPtr output = Marshal.AllocHGlobal(4);
+        IntPtr gray = Marshal.AllocHGlobal(1);
+        IntPtr rgba = Marshal.AllocHGlobal(4);
         try
         {
-            Marshal.Copy(y, 0, yPtr, y.Length);
-            Marshal.Copy(uv, 0, uvPtr, uv.Length);
-            using var image = CreateGpuImage(PixelFormat.Bgra32, width, height);
-            image.UpdateTile(0, 0, 0, yPtr, width, uvPtr, width, PixelFormat.Yuv420);
-            image.Load(0, outputPtr, width, height, width * 4, PixelFormat.Bgra32, TransformMatrix.Identity);
-            Marshal.Copy(outputPtr, output, 0, output.Length);
-            Assert.InRange(output[0], (byte)75, (byte)105);
-            Assert.InRange(output[1], (byte)75, (byte)105);
-            Assert.InRange(output[2], (byte)75, (byte)105);
+            Marshal.WriteByte(gray, 75);
+            Marshal.Copy(new byte[] { 20, 30, 40, 255 }, 0, rgba, 4);
+            image.Update(0, gray, 1, 1, 1, PixelFormat.Gray8, TransformMatrix.Identity);
+            var program = image.GetUpdateProgram();
+            image.Load(0, output, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            byte[] first = new byte[4];
+            Marshal.Copy(output, first, 0, 4);
+            Assert.Equal(new byte[] { 75, 0, 0, 255 }, first);
+
+            image.UpdateTile(0, 0, 0, rgba, 1, 1, 4, PixelFormat.Rgba32);
+            Assert.Same(program, image.GetUpdateProgram());
+            image.Update(0, rgba, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            Assert.Same(program, image.GetUpdateProgram());
+            image.Load(0, output, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            byte[] second = new byte[4];
+            Marshal.Copy(output, second, 0, 4);
+            Assert.Equal(new byte[] { 20, 30, 40, 255 }, second);
         }
         finally
         {
-            Marshal.FreeHGlobal(yPtr);
-            Marshal.FreeHGlobal(uvPtr);
-            Marshal.FreeHGlobal(outputPtr);
+            Marshal.FreeHGlobal(output);
+            Marshal.FreeHGlobal(gray);
+            Marshal.FreeHGlobal(rgba);
         }
     }
 
     [Fact]
-    public void Packed24TileFormatConversionUsesGpuForRgbaStorage()
+    public void LoadProgramIsReusedAcrossOutputFormatsAndComposeOwnsItsProgram()
     {
-        byte[] source = { 10, 20, 30, 40, 50, 60 };
-        byte[] output = new byte[8];
-        IntPtr sourcePtr = Marshal.AllocHGlobal(source.Length);
-        IntPtr outputPtr = Marshal.AllocHGlobal(output.Length);
+        using var image = CreateGpuImage(PixelFormat.Rgba32, 1, 1);
+        IntPtr rgba = Marshal.AllocHGlobal(4);
+        IntPtr output = Marshal.AllocHGlobal(4);
         try
         {
-            Marshal.Copy(source, 0, sourcePtr, source.Length);
-            using var image = CreateGpuImage(PixelFormat.Rgba32, 2, 1);
-            image.UpdateTile(0, 0, 0, sourcePtr, 2, 1, 6, PixelFormat.Bgr24);
-            image.Load(0, outputPtr, 2, 1, 8, PixelFormat.Rgba32, TransformMatrix.Identity);
-            Marshal.Copy(outputPtr, output, 0, output.Length);
-            Assert.Equal(30, output[0]);
-            Assert.Equal(20, output[1]);
-            Assert.Equal(10, output[2]);
-            Assert.Equal(255, output[3]);
+            Marshal.Copy(new byte[] { 90, 70, 50, 255 }, 0, rgba, 4);
+            image.UpdateTile(0, 0, 0, rgba, 1, 1, 4, PixelFormat.Rgba32);
+            image.Load(0, output, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            var program = image.GetLoadProgram();
+            image.Load(0, output, 1, 1, 4, PixelFormat.Bgra32, TransformMatrix.Identity);
+            Assert.Same(program, image.GetLoadProgram());
+
+            using var compose = image.CreateLayerCompose("a.r, a.g, a.b, 1");
+            image.Load(compose, output, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity);
+            var composeProgram = compose.GetLoadProgram();
+            Assert.NotSame(program, composeProgram);
+            image.Load(compose, output, 1, 1, 4, PixelFormat.Bgra32, TransformMatrix.Identity);
+            Assert.Same(composeProgram, compose.GetLoadProgram());
+            compose.Dispose();
+            Assert.Throws<ArgumentException>(() => image.Load(compose, output, 1, 1, 4, PixelFormat.Rgba32, TransformMatrix.Identity));
         }
         finally
         {
-            Marshal.FreeHGlobal(sourcePtr);
-            Marshal.FreeHGlobal(outputPtr);
+            Marshal.FreeHGlobal(rgba);
+            Marshal.FreeHGlobal(output);
         }
     }
 
