@@ -9,7 +9,7 @@ namespace GrotheImages;
 
 internal static class ShaderCompiler
 {
-    public static unsafe Blob Compile(string source, string entryPoint, string target)
+    public static unsafe Blob Compile(string source, string sourceName, string entryPoint, string target, Include include)
     {
         byte[] bytes = Encoding.UTF8.GetBytes(source);
         GCHandle handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
@@ -20,9 +20,9 @@ internal static class ShaderCompiler
             Result result = Compiler.Compile(
                 (void*)handle.AddrOfPinnedObject(),
                 bytes.Length,
-                "GrotheImages.hlsl",
+                sourceName,
                 null,
-                null,
+                include,
                 entryPoint,
                 target,
                 ShaderFlags.None,
@@ -33,7 +33,8 @@ internal static class ShaderCompiler
             {
                 string message = errors == null ? result.Description : errors.AsString();
                 errors?.Dispose();
-                throw new GrotheImageException("HLSL compilation failed: " + message);
+                string generated = include is ShaderInclude shaderInclude ? Environment.NewLine + shaderInclude.GeneratedSource : string.Empty;
+                throw new GrotheImageException("HLSL compilation failed in " + sourceName + " for " + entryPoint + " (" + target + "): " + message + generated);
             }
             errors?.Dispose();
             return code;

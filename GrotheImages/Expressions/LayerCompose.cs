@@ -203,7 +203,9 @@ internal sealed class LayerExpression : ExpressionNode
     }
 
     public int LayerIndex { get; }
-    public override string ToHlsl() => "Layer" + LayerIndex;
+
+    // The generated Compose() function receives every sampled layer as an array.
+    public override string ToHlsl() => "layers[" + LayerIndex + "]";
 }
 
 internal sealed class SwizzleExpression : ExpressionNode

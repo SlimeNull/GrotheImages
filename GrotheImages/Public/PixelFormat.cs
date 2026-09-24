@@ -19,6 +19,11 @@ internal static class PixelFormatRules
         return format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420;
     }
 
+    public static bool IsYuv(PixelFormat format)
+    {
+        return format == PixelFormat.Yuv444 || format == PixelFormat.Yuv422 || format == PixelFormat.Yuv420;
+    }
+
     public static bool IsTransferFormat(PixelFormat format) =>
         format == PixelFormat.Bgra32 || format == PixelFormat.Rgba32 || format == PixelFormat.Gray8;
 

@@ -69,4 +69,4 @@ Load 必须把 GPU 结果交给用户内存，所以 staging map 和 CPU 行复�
 - 直接格式匹配时跳过 shader 和中间资源。
 - 24 位和 YUV 传输格式会在参数校验时拒绝；Playground 使用 WPF 解码器将这类输入图像转换为 BGRA32。
 - 每个 `GrotheImage` 最多创建一个普通 Load program 和一个 Update program；每个被实际加载的 `LayerCompose` 最多创建一个自己的 Load program，重复调用时只创建单次传输纹理。
-- `Shaders/Common.hlsl` 以 embedded resource 形式随程序集发布，进程内只读取和解析一次（成员重载表）；`CreateLayerCompose` 只做签名匹配，`Load` 不重复解析。只有表达式中用到成员时才会把这份源码拼进生成的 pixel shader，纯 swizzle 表达式的 shader 源码保持不变。
+- `Shaders/` 下的 HLSL 以 embedded resource 形式随程序集发布，进程内只读取和解析一次（成员重载表）；`CreateLayerCompose` 只做签名匹配，`Load` 不重复解析。C# 侧不拼接 shader 源码，只生成一个 `macros` include：`LAYER_COUNT`、`STORAGE_*`、`MEMBER_LIBRARY` 和 `COMPOSE_PIXEL` 都在其中，shader 用 `#if` 选择分支。只有表达式真的用到成员时 `MEMBER_LIBRARY` 才会被定义，`Common.hlsl` 也才会被 include 进这次编译。

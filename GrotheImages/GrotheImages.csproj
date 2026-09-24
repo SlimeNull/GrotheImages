@@ -12,7 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <EmbeddedResource Include="Shaders\Common.hlsl" />
+    <EmbeddedResource Include="Shaders\*" />
   </ItemGroup>
 
   <ItemGroup>

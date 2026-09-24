@@ -1,5 +1,5 @@
 using System;
-using System.Text;
+using System.Collections.Generic;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.Mathematics;
@@ -92,7 +92,11 @@ internal sealed class UpdateProgram : IDisposable
     {
         if (_shader != null) return;
         _targetFormat = _image.Format;
-        using (var blob = ShaderCompiler.Compile(BuildShaderSource(_targetFormat), "CSMain", "cs_5_0"))
+        var include = new ShaderInclude(new[]
+        {
+            new KeyValuePair<string, string>("macros", ShaderSource.Macros(BuildMacros(_targetFormat))),
+        });
+        using (var blob = ShaderCompiler.Compile(ShaderSource.Load("Update.hlsl"), "Update.hlsl", "CSMain", "cs_5_0", include))
             _shader = _image.Graphics.Device.CreateComputeShader(blob, null);
         _sampler = _image.Graphics.Device.CreateSamplerState(new SamplerDescription(
             Filter.MinMagMipLinear, TextureAddressMode.Clamp, TextureAddressMode.Clamp,
@@ -100,6 +104,14 @@ internal sealed class UpdateProgram : IDisposable
         _constants = _image.Graphics.Device.CreateBuffer(
             new float[24], BindFlags.ConstantBuffer, ResourceUsage.Default,
             CpuAccessFlags.None, ResourceOptionFlags.None, 0, 0);
+    }
+
+    /// <summary>The generated <c>macros</c> include: which storage planes the compute shader writes.</summary>
+    internal static IEnumerable<KeyValuePair<string, string>> BuildMacros(PixelFormat targetFormat)
+    {
+        if (PixelFormatRules.IsYuv(targetFormat)) yield return new KeyValuePair<string, string>("STORAGE_YUV", null);
+        else if (targetFormat == PixelFormat.Gray8) yield return new KeyValuePair<string, string>("STORAGE_GRAY", null);
+        else yield return new KeyValuePair<string, string>("STORAGE_RGBA", null);
     }
 
     private void DispatchTile(LayerStore store, ID3D11ShaderResourceView view, long row, long column,
@@ -148,35 +160,5 @@ internal sealed class UpdateProgram : IDisposable
         _sampler = null;
         _shader = null;
         _image = null;
-    }
-
-    private static string BuildShaderSource(PixelFormat targetFormat)
-    {
-        bool targetYuv = targetFormat == PixelFormat.Yuv444 || targetFormat == PixelFormat.Yuv422 || targetFormat == PixelFormat.Yuv420;
-        bool targetGray = targetFormat == PixelFormat.Gray8;
-        var b = new StringBuilder();
-        b.AppendLine("Texture2D<float4> Source : register(t0);");
-        b.AppendLine("SamplerState LinearSampler : register(s0);");
-        if (targetYuv)
-            b.AppendLine("RWTexture2DArray<float> YTarget : register(u0); RWTexture2DArray<float2> UvTarget : register(u1);");
-        else if (targetGray)
-            b.AppendLine("RWTexture2DArray<float> Target : register(u0);");
-        else
-            b.AppendLine("RWTexture2DArray<float4> Target : register(u0);");
-        b.AppendLine("cbuffer Params : register(b0) { float4 M0; float4 M1; float4 M2; float4 Grid; float4 Tile; float4 SourceSize; };");
-        if (targetYuv)
-            b.AppendLine("float3 ToYuv(float3 rgb) { float y=dot(rgb,float3(0.2126,0.7152,0.0722)); return float3(y, (rgb.b-y)*0.5389+0.5, (rgb.r-y)*0.6350+0.5); }");
-        b.AppendLine("[numthreads(8,8,1)] void CSMain(uint3 id : SV_DispatchThreadID) {");
-        b.AppendLine("if (id.x >= Tile.x || id.y >= Tile.y) return; float2 global=float2(Tile.z+id.x+0.5, Tile.w+id.y+0.5); float3 q=float3(dot(M0.xyz,float3(global,1)),dot(M1.xyz,float3(global,1)),dot(M2.xyz,float3(global,1))); float2 source=q.xy/q.z; if(source.x<0||source.y<0||source.x>=SourceSize.x||source.y>=SourceSize.y)return; float4 value=Source.SampleLevel(LinearSampler, source/SourceSize.xy, 0);");
-        if (targetYuv)
-        {
-            b.AppendLine("float3 yuv=ToYuv(value.rgb);");
-            b.AppendLine("YTarget[uint3(id.xy, (uint)SourceSize.z)] = yuv.x;");
-            b.AppendLine("if ((SourceSize.w < 0.5 || (id.x & 1)==0) && (SourceSize.w < 1.5 || (id.y & 1)==0)) UvTarget[uint3(SourceSize.w < 0.5 ? id.x : id.x/2, SourceSize.w < 1.5 ? id.y : id.y/2, (uint)SourceSize.z)] = yuv.yz;");
-        }
-        else if (targetGray) b.AppendLine("Target[uint3(id.xy, (uint)SourceSize.z)] = value.r;");
-        else b.AppendLine("Target[uint3(id.xy, (uint)SourceSize.z)] = value;");
-        b.AppendLine("}");
-        return b.ToString();
     }
 }

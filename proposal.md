@@ -467,26 +467,50 @@ a.lum, b.rgb
 `Shaders/Common.hlsl` 中声明的每个函数都是 layer 的“成员”。`layer.member` 把该 layer 解码出的 `float4` 作为函数的第一个参数，`layer.member(args...)` 的其它参数按顺序跟在后面：
 
 ```text
-a.lum                 -> lum(Layer0)                              1 通道
-a.rgb.lum             -> lum(Layer0.rgb)                          1 通道
-a.hsv.rgb             -> (hsv(Layer0)).rgb                        3 通道
-a.bin(0.5)            -> bin(Layer0, (float4)(0.5))               4 通道
-a.bin2(0.1, 0.4)      -> bin2(Layer0, (float4)(0.1), (float4)(0.4))
-a.bin(b.r)            -> bin(Layer0, (float4)(Layer1.r))
+a.lum                 -> lum(layers[0])                              1 通道
+a.rgb.lum             -> lum(layers[0].rgb)                          1 通道
+a.hsv.rgb             -> (hsv(layers[0])).rgb                        3 通道
+a.bin(0.5)            -> bin(layers[0], (float4)(0.5))               4 通道
+a.bin2(0.1, 0.4)      -> bin2(layers[0], (float4)(0.1), (float4)(0.4))
+a.bin(b.r)            -> bin(layers[0], (float4)(layers[1].r))
 ```
 
 - 成员表在运行时从 `Common.hlsl` 的函数签名解析得到，因此新增或修改成员只需要改 shader 文件，C# 侧没有第二份需要同步的名单。签名参数无法用 float1..float4 表达（例如 `int`）时，该重载对表达式不可见。
 - 重载按第一个参数（操作数）的宽度和参数个数选择。其余参数必须宽度完全匹配，或者是标量（生成 HLSL 时显式 splat 成 `floatN`，不依赖隐式标量提升）。
 - 成员结果的宽度决定它在表达式里贡献的通道数，例如 `a.lum` 是 1，`a.bin(0.5)` 是 4。返回值之后还可以继续 swizzle 或再套成员。
 - 找不到匹配重载、参数个数不符或引用了不存在的成员时，`CreateLayerCompose` 立即抛出带字符位置和可用重载列表的 `FormatException`。
-- 只有真正用到成员的表达式才会把 `Common.hlsl` 拼进生成的 shader；纯 swizzle 表达式保持原有的源码。
+- 只有真正用到成员的表达式才会定义 `MEMBER_LIBRARY`，从而让 `Load.hlsl` 去 `#include "Common.hlsl"`；纯 swizzle 表达式编译时不带这份源码。
 - 所有 layer 共享同一个 `Common.hlsl`，成员输入是逻辑通道（RGB 为 R/G/B/A，Gray8 为 v/v/v/1，YUV 为 Y/U/V/1），因此 `a.lum` 在 YUV 图像上按 (Y,U,V) 计算。
 
-### 7.3 HLSL 生成和缓存
+### 7.3 着色器文件、宏注入和缓存
 
-AST 经类型检查后生成 HLSL 函数。每个 layer 引用编译成对该 layer `Texture2DArray`/YUV 双 array 的采样 accessor，矩阵逆变换、采样归属 tile 计算和 page/slice 选择由 Load render pass 统一完成。普通 Load program 存在 GrotheImage 中，Compose Load program 存在 LayerCompose 中；同一实例重复 Load 时复用已经创建的 shader、sampler 和 constant buffer。`UpdateProgram` 也按 GrotheImage 保存一个实例，第一次 Execute 时延迟创建目标存储格式对应的 shader，之后在 Bgra32、Rgba32、Gray8 输入之间复用。
+所有着色器都是 `Shaders/` 下的 HLSL 源文件，并作为 embedded resource 随程序集发布，部署时不依赖磁盘上的文件：
 
-生产模式下优先使用离线 shader 编译产物，开发模式允许调用 `D3DCompile` 并记录源码。编译错误转换为 `GrotheImageException`，其中包含原表达式、生成的 HLSL 和编译器行号，方便定位。
+| 文件 | 作用 |
+| --- | --- |
+| `Shaders/Load.hlsl` | Load 的 vertex + pixel shader；声明 layer 资源数组、采样 accessor、tile 归属计算和输出转换 |
+| `Shaders/Update.hlsl` | Update/UpdateTile 的 compute shader；采样上传纹理并写入 tile UAV |
+| `Shaders/Common.hlsl` | 表达式成员函数库（`lum`、`hsv`、`bin` 等），只在表达式用到成员时被 include |
+| `Shaders/macros` | `macros` include 的默认内容，供编辑器/离线编译单独编译 shader 时使用 |
+
+C# 侧不再拼接 HLSL 文本，只生成一个 `macros` include（沿用同一套 DX 工程里 `<macros>` 的做法），由 `ShaderInclude` 在 `#include <macros>` 时解析，其余 include（例如 `Common.hlsl`）从 embedded resource 读取：
+
+```text
+// 这次 draw 绑定的 layer 数量
+#define LAYER_COUNT 2
+// 或 STORAGE_GRAY / STORAGE_YUV
+#define STORAGE_RGBA
+// 仅当表达式用到成员，触发 #include "Common.hlsl"
+#define MEMBER_LIBRARY
+// 编译后的表达式，已补齐到 4 个通道
+#define COMPOSE_PIXEL layers[0].rgb, 1
+```
+
+存储格式、layer 数量、是否包含成员库、以及编译后的表达式全部通过宏注入，shader 内部用 `#if defined(STORAGE_YUV)` 之类的条件编译选择分支，因此同一份 HLSL 同时覆盖 RGB、Gray8、YUV 存储和 1..4 通道的表达式。layer 以资源数组声明（YUV 存储时 luma 数组在前、chroma 数组紧随其后），像素着色器用 `[unroll]` 循环把每层采样进 `float4 layers[LAYER_COUNT]`，表达式只以常量下标访问它。
+
+AST 经类型检查后生成的是 `COMPOSE_PIXEL` 宏的值：每个 layer 引用编译成对 `layers[n]` 的访问，补齐规则（1/2/3 通道 → 4 通道）在这里完成，矩阵逆变换、采样归属 tile 计算和 page/slice 选择仍由 Load render pass 统一完成。普通 Load program 存在 GrotheImage 中，Compose Load program 存在 LayerCompose 中；同一实例重复 Load 时复用已经创建的 shader、sampler 和 constant buffer。`UpdateProgram` 也按 GrotheImage 保存一个实例，第一次 Execute 时延迟创建目标存储格式对应的 shader，之后在 Bgra32、Rgba32、Gray8 输入之间复用。
+
+生产模式下优先使用离线 shader 编译产物，开发模式允许调用 `D3DCompile` 并记录源码。编译错误转换为 `GrotheImageException`，其中包含 shader 文件名、编译器给出的行列号和这次注入的宏内容（含表达式），方便定位。
 
 当一次 compose 读取多个 tile 时，各 layer 必须使用同一逻辑坐标和同一边界透明规则。调度器按 tile 组合规划 dispatch，不能让不同 layer 采用不同的 tile 原点，否则表达式中的通道会错位。
 

@@ -1,0 +1,8 @@
+// Default macros, used when a shader is compiled on its own (editor, offline fxc). LoadProgram and
+// UpdateProgram replace this file with the macros that describe the image being processed.
+#define LAYER_COUNT 1
+#define STORAGE_RGBA
+
+// The pixel produced by the load pass: the compose expression, padded to four channels by LoadProgram.
+// `layers` holds the logical channels of every layer, already sampled at the current pixel.
+#define COMPOSE_PIXEL layers[0]

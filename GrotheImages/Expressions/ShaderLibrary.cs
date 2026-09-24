@@ -1,8 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
-using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -81,23 +79,7 @@ internal static class ShaderLibrary
         return string.Join(", ", overloads.Select(x => x.ToString()).ToArray());
     }
 
-    private static string LoadSource()
-    {
-        Assembly assembly = typeof(ShaderLibrary).Assembly;
-        foreach (string name in assembly.GetManifestResourceNames())
-        {
-            if (!name.EndsWith("Common.hlsl", StringComparison.OrdinalIgnoreCase)) continue;
-            using (Stream stream = assembly.GetManifestResourceStream(name))
-            {
-                if (stream == null) continue;
-                using (var reader = new StreamReader(stream, Encoding.UTF8))
-                {
-                    return reader.ReadToEnd();
-                }
-            }
-        }
-        throw new GrotheImageException("The embedded shader library 'Common.hlsl' is missing from the GrotheImages assembly.");
-    }
+    private static string LoadSource() => ShaderSource.Load("Common.hlsl");
 
     private static Dictionary<string, List<MemberOverload>> ParseMembers(string source)
     {
